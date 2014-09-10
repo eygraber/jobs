@@ -1,0 +1,70 @@
+task wrapper(type: org.gradle.api.tasks.wrapper.Wrapper) {
+    gradleVersion = '1.6'
+}
+
+buildscript {
+    repositories {
+        mavenCentral()
+    }
+    dependencies {
+        classpath 'com.android.tools.build:gradle:+'
+    }
+}
+apply plugin: 'com.android.library'
+
+repositories {
+    mavenCentral()
+}
+
+dependencies {
+    compile 'com.google.code.gson:gson:2.3'
+}
+
+android {
+    compileSdkVersion 20
+    buildToolsVersion '20.0.0'
+
+    defaultConfig {
+        minSdkVersion 9
+        targetSdkVersion 20
+        versionCode 1
+        versionName "1.0"
+    }
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_1_7
+        targetCompatibility JavaVersion.VERSION_1_7
+    }
+    sourceSets {
+        main {
+            manifest.srcFile 'AndroidManifest.xml'
+
+            java {
+                srcDir 'src/'
+            }
+        }
+    }
+    lintOptions {
+        abortOnError false
+    }
+    publishNonDefault true
+}
+
+// upload to maven task
+/*if (System.getenv().I_AM_KOUSH == 'true') {
+    apply from: 'https://raw.githubusercontent.com/koush/mvn-repo/master/maven.gradle'
+
+    apply plugin: 'maven'
+    apply plugin: 'signing'
+
+    afterEvaluate { project ->
+        uploadArchives {
+            repositories {
+                mavenDeployer {
+                    pom*.whenConfigured { pom ->
+                        pom.dependencies.removeAll { dep -> dep.artifactId == 'support-v4' }
+                    }
+                }
+            }
+        }
+    }
+}*/

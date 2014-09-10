@@ -17,9 +17,13 @@ public class BasicJobQueue implements JobQueue {
 
     private LinkedList<JobWrapper> newJobs;
     private LinkedList<JobWrapper> futureJobs;
+    private Map<String, LinkedList<JobWrapper>> groupMap;
     private Map<Long, JobStatus> jobStatusMap;
+    private Map<String, Integer> groupIndexMap;
     private Set<Long> canceledJobs;
     private Set<String> inFlightUIDs;
+
+    private final Object groupIndexMapLock = new Object();
 
     private AtomicLong nextJobId;
     private AtomicBoolean shouldCancelAll;
@@ -30,7 +34,9 @@ public class BasicJobQueue implements JobQueue {
 
         newJobs = new LinkedList<JobWrapper>();
         futureJobs = new LinkedList<JobWrapper>();
+        groupMap = new HashMap<String, LinkedList<JobWrapper>>();
         jobStatusMap = new HashMap<Long, JobStatus>();
+        groupIndexMap = new HashMap<String, Integer>();
         canceledJobs = new HashSet<Long>();
         inFlightUIDs = new HashSet<String>();
 
@@ -51,6 +57,7 @@ public class BasicJobQueue implements JobQueue {
         if(job.areMultipleInstancesAllowed() || !inFlightUIDs.contains(job.getUID())) {
             status = new JobStatus(nextJobId.getAndIncrement(), job);
             newJobs.addLast(new JobWrapper(status));
+            status.setState(JobStatus.State.ADDED);
             inFlightUIDs.add(job.getUID());
             jobStatusMap.put(status.getJobId(), status);
         }
@@ -69,8 +76,8 @@ public class BasicJobQueue implements JobQueue {
         JobStatus status;
         if(job.areMultipleInstancesAllowed() || !inFlightUIDs.contains(job.getUID())) {
             status = new JobStatus(nextJobId.getAndIncrement(), job);
-            status.setState(JobStatus.State.COLD_STORAGE);
             futureJobs.addLast(new JobWrapper(status, System.currentTimeMillis() + delayMillis));
+            status.setState(JobStatus.State.COLD_STORAGE);
             inFlightUIDs.add(job.getUID());
             jobStatusMap.put(status.getJobId(), status);
         }
@@ -84,8 +91,11 @@ public class BasicJobQueue implements JobQueue {
         while(!newJobs.isEmpty()) {
             JobWrapper jw = newJobs.getFirst();
             if(jw != null) {
-                jw.getStatus().setState(JobStatus.State.QUEUED);
+                if(jw.isGroupMember()) {
+                    jw.obtainGroupIndex(this);
+                }
                 queue.add(jw);
+                jw.getStatus().setState(JobStatus.State.QUEUED);
             }
         }
     }
@@ -94,8 +104,8 @@ public class BasicJobQueue implements JobQueue {
         while(!futureJobs.isEmpty()) {
             JobWrapper jw = futureJobs.getFirst();
             if(jw != null && jw.getValidAtTime() <= System.currentTimeMillis()) {
-                jw.getStatus().setState(JobStatus.State.QUEUED);
                 queue.add(jw);
+                jw.getStatus().setState(JobStatus.State.QUEUED);
             }
         }
     }
@@ -122,7 +132,9 @@ public class BasicJobQueue implements JobQueue {
         ArrayList<Long> jobStatusKeys = new ArrayList<Long>(jobStatusMap.keySet());
         for (Long id : jobStatusKeys) {
             JobStatus status = jobStatusMap.get(id);
-            status.setState(JobStatus.State.CANCELED);
+            if(status != null) {
+                status.setState(JobStatus.State.CANCELED);
+            }
         }
         jobStatusMap.clear();
         canceledJobs.clear();
@@ -134,12 +146,20 @@ public class BasicJobQueue implements JobQueue {
         return jobStatusMap.get(jobId);
     }
 
+    @Override
+    public void shutdown() {
+
+    }
+
     private static class JobWrapper {
         private long validAtTime;
         private JobStatus status;
+        private int groupIndex = -1;
 
         private int networkRetryCount = 0;
         private BackoffPolicy networkBackoffPolicy = new BackoffPolicy.Step(1000, 3000);
+        private int groupRetryCount = 0;
+        private BackoffPolicy groupBackoffPolicy = new BackoffPolicy.Linear(1000);
 
         public JobWrapper(JobStatus status) {
             this(status, System.currentTimeMillis());
@@ -148,6 +168,26 @@ public class BasicJobQueue implements JobQueue {
         public JobWrapper(JobStatus status, long validAtTime) {
             this.status = status;
             this.validAtTime = validAtTime;
+        }
+
+        public void obtainGroupIndex(BasicJobQueue queue) {
+            String group = status.getJob().getGroup();
+            if(group != null) {
+                synchronized(queue.groupIndexMapLock) {
+                    Integer index = queue.groupIndexMap.get(group);
+                    if(index == null) {
+                        index = 0;
+                    }
+                    queue.groupIndexMap.put(group, index + 1);
+                    LinkedList<JobWrapper> groupQueue = queue.groupMap.get(group);
+                    if(groupQueue == null) {
+                        groupQueue = new LinkedList<JobWrapper>();
+                        queue.groupMap.put(group, groupQueue);
+                    }
+                    groupQueue.addLast(this);
+                    this.groupIndex = index;
+                }
+            }
         }
 
         public Job getJob() {
@@ -177,6 +217,35 @@ public class BasicJobQueue implements JobQueue {
         public long getNetworkRetryBackoffMillis() {
             return networkBackoffPolicy.getNextMillis(networkRetryCount);
         }
+
+        public void incrementGroupRetryCount() {
+            groupRetryCount++;
+        }
+
+        public long getGroupRetryBackoffMillis() {
+            return groupBackoffPolicy.getNextMillis(groupRetryCount);
+        }
+
+        public boolean isGroupMember() {
+            return groupIndex >= 0 && status.getJob().getGroup() != null;
+        }
+
+        public int getGroupIndex() {
+            return groupIndex;
+        }
+
+        public String getGroup() {
+            return status.getJob().getGroup();
+        }
+
+        public boolean equals(JobWrapper other) {
+            if(other == null) {
+                return false;
+            }
+            else {
+                return getJob().getUID().equals(other.getJob().getUID());
+            }
+        }
     }
 
     private static class JobComparator implements Comparator<JobWrapper> {
@@ -197,6 +266,12 @@ public class BasicJobQueue implements JobQueue {
                 return 1;
             }
             else {
+                if(lhs.isGroupMember() && rhs.isGroupMember()) {
+                    if(lhsJob.getGroup().equals(rhsJob.getGroup())) {
+                        return rhs.getGroupIndex() - lhs.getGroupIndex();
+                    }
+                }
+
                 return lhsJob.getPriority() - rhsJob.getPriority();
             }
         }
@@ -261,12 +336,29 @@ public class BasicJobQueue implements JobQueue {
                     } catch(Throwable ignore) {}
                 }
 
+                if(wrapper.isGroupMember()) {
+                    LinkedList<JobWrapper> groupQueue = groupMap.get(wrapper.getGroup());
+                    // it should never be null
+                    if(groupQueue != null) {
+                        if(!wrapper.equals(groupQueue.peekFirst())) {
+                            wrapper.incrementGroupRetryCount();
+                            wrapper.setValidAtTime(System.currentTimeMillis() + wrapper.getGroupRetryBackoffMillis());
+                            wrapper.getStatus().setState(JobStatus.State.COLD_STORAGE);
+                            futureJobs.addLast(wrapper);
+                            continue;
+                        }
+                    }
+                }
+
                 boolean retry = false;
                 do {
                     try {
                         j.performJob();
                         if(j instanceof Waitable) {
                             ((Waitable) j).await();
+                        }
+                        if(wrapper.isGroupMember()) {
+                            popGroupQueue(wrapper);
                         }
                     }
                     catch(Throwable e) {
@@ -283,6 +375,9 @@ public class BasicJobQueue implements JobQueue {
                                 try {
                                     j.onRetryLimitReached();
                                 } catch(Throwable ignore) {}
+                                if(wrapper.isGroupMember()) {
+                                    popGroupQueue(wrapper);
+                                }
                             }
                             else {
                                 j.onRetry();
@@ -303,11 +398,31 @@ public class BasicJobQueue implements JobQueue {
                                 }
                             }
                         }
+                        else {
+                            if(wrapper.isGroupMember()) {
+                                popGroupQueue(wrapper);
+                            }
+                        }
                     }
                 } while(retry);
 
             }
+        }
 
+        private void popGroupQueue(JobWrapper wrapper) {
+            synchronized(groupIndexMapLock) {
+                LinkedList<JobWrapper> groupQueue = groupMap.get(wrapper.getGroup());
+                // it should never be null
+                if(groupQueue != null) {
+                    // since we're the head of the queue
+                    // pop the queue so the next job in the group can run
+                    groupQueue.removeFirst();
+                    //reset the group index
+                    if(groupQueue.isEmpty()) {
+                        groupIndexMap.put(wrapper.getGroup(), 0);
+                    }
+                }
+            }
         }
     }
 

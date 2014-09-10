@@ -37,4 +37,10 @@ public interface JobQueue {
      * @return the {@code Job}'s {@code JobStatus} if it is in the queue, or null
      */
     public JobStatus getStatus(long jobId);
+
+    /**
+     * Shuts down the {@code JobQueue} and releases its resources. The instance should not be
+     * used anymore after calling shutdown.
+     */
+    public void shutdown();
 }

@@ -64,6 +64,25 @@ public interface BackoffPolicy {
     }
 
     /**
+     * A {@link com.staticbloc.jobs.BackoffPolicy} that backsoff using a constant value.
+     * The algorithm is {@code getBaseWaitTimeMillis()}.
+     */
+    public static class Constant extends Base {
+        public Constant(long baseWaitTimeMillis) {
+            this(baseWaitTimeMillis, NO_PLATEAU);
+        }
+
+        public Constant(long baseWaitTimeMillis, int plateau) {
+            super(baseWaitTimeMillis, plateau);
+        }
+
+        @Override
+        public long getNextMillis(int backoffCount) {
+            return getBaseWaitTimeMillis();
+        }
+    }
+
+    /**
      * A {@link com.staticbloc.jobs.BackoffPolicy} that backsoff linearly.
      * The algorithm is {@code getBaseWaitTimeMillis() * backoffCount}.
      */
