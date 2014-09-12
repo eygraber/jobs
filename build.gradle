@@ -16,10 +16,6 @@ repositories {
     mavenCentral()
 }
 
-dependencies {
-    compile 'com.google.code.gson:gson:2.3'
-}
-
 android {
     compileSdkVersion 20
     buildToolsVersion '20.0.0'
@@ -47,6 +43,10 @@ android {
         abortOnError false
     }
     publishNonDefault true
+}
+
+dependencies {
+    compile 'com.google.code.gson:gson:2.3'
 }
 
 // upload to maven task

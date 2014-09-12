@@ -2,22 +2,27 @@ package com.staticbloc.jobs;
 
 public interface JobQueue {
     /**
+     * Returns a name that uniquely identifies this {@link JobQueue}.
+     */
+    public String getName();
+
+    /**
      * Add a new {@link Job} to the queue.
      * @param job the {@code Job} to add
      * @return a {@link JobStatus} indicating whether the {@code Job}
      * was added successfully, and if so, some information about the {@code Job}.
      */
-    public JobStatus enqueue(Job job);
+    public JobStatus add(Job job);
 
     /**
-     * Add a new {@link Job} to the queue. It will not be run until at least the {@code delayMillis}
-     * passed.
+     * Add a new {@link Job} to the queue.
+     * It will not be run until at least the {@code delayMillis} passed.
      * @param job the {@code Job} to add
      * @param delayMillis how long to wait before running the {@code Job}
      * @return a {@link JobStatus} indicating whether the {@code Job}
      * was added successfully, and if so, some information about the {@code Job}.
      */
-    public JobStatus enqueue(Job job, long delayMillis);
+    public JobStatus add(Job job, long delayMillis);
 
     /**
      * Makes a best effort attempt to cancel the {@link Job} before it runs.
@@ -39,8 +44,18 @@ public interface JobQueue {
     public JobStatus getStatus(long jobId);
 
     /**
-     * Shuts down the {@code JobQueue} and releases its resources. The instance should not be
-     * used anymore after calling shutdown.
+     * Shuts down the {@link JobQueue} and releases its resources. Any non-persisted
+     * {@link Job}s will be lost. The instance should not be used anymore
+     * after calling shutdown.
      */
     public void shutdown();
+
+    /**
+     * Shuts down the {@link JobQueue} and releases its resources. Any non-persisted
+     * {@link Job}s will be lost. The instance should not be used anymore
+     * after calling shutdown.
+     *
+     * @param keepPersisted if {@code false} persisted {@code Job}s will be cleared
+     */
+    public void shutdown(boolean keepPersisted);
 }

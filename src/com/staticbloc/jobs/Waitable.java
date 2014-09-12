@@ -2,15 +2,15 @@ package com.staticbloc.jobs;
 
 public interface Waitable {
     /**
-     * Returns the amount of times {@link Waitable#unlock()} has to be called before
-     * {@link Waitable#await()} will stop blocking.
+     * Returns the amount of times {@link Waitable#unlock()}
+     * has to be called before {@link Waitable#await()} will stop blocking.
      * @see Waitable#unlock()
      * @see Waitable#await()
      */
     public int getInitialLockCount();
 
     /**
-     * The invoking {@link Thread} will wait until all locks are unlocked.
+     * The invoking {@link java.lang.Thread} will wait until all locks are unlocked.
      * @throws InterruptedException if the {@code Thread} is interrupted while waiting
      * @see Waitable#unlock() ()
      */
