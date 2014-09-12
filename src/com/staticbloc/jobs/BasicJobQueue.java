@@ -56,7 +56,7 @@ public class BasicJobQueue implements JobQueue {
         JobStatus status;
         if(job.areMultipleInstancesAllowed() || !inFlightUIDs.contains(job.getUID())) {
             status = new JobStatus(nextJobId.getAndIncrement(), job);
-            newJobs.addLast(new JobQueueItemImpl(status));
+            newJobs.addLast(new JobQueueItem(status));
             status.setState(JobStatus.State.ADDED);
             inFlightUIDs.add(job.getUID());
             jobStatusMap.put(status.getJobId(), status);
@@ -76,7 +76,7 @@ public class BasicJobQueue implements JobQueue {
         JobStatus status;
         if(job.areMultipleInstancesAllowed() || !inFlightUIDs.contains(job.getUID())) {
             status = new JobStatus(nextJobId.getAndIncrement(), job);
-            futureJobs.addLast(new JobQueueItemImpl(status, System.currentTimeMillis() + delayMillis));
+            futureJobs.addLast(new JobQueueItem(status, System.currentTimeMillis() + delayMillis));
             status.setState(JobStatus.State.COLD_STORAGE);
             inFlightUIDs.add(job.getUID());
             jobStatusMap.put(status.getJobId(), status);
@@ -151,7 +151,7 @@ public class BasicJobQueue implements JobQueue {
 
     }
 
-    private class JobQueueItemImpl implements JobQueueItem {
+    private class JobQueueItem {
         private long validAtTime;
         private JobStatus status;
         private int groupIndex = -1;
@@ -161,16 +161,15 @@ public class BasicJobQueue implements JobQueue {
         private int groupRetryCount = 0;
         private BackoffPolicy groupBackoffPolicy = new BackoffPolicy.Linear(1000);
 
-        public JobQueueItemImpl(JobStatus status) {
+        public JobQueueItem(JobStatus status) {
             this(status, System.currentTimeMillis());
         }
 
-        public JobQueueItemImpl(JobStatus status, long validAtTime) {
+        public JobQueueItem(JobStatus status, long validAtTime) {
             this.status = status;
             this.validAtTime = validAtTime;
         }
 
-        @Override
         public void obtainGroupIndex() {
             String group = status.getJob().getGroup();
             if(group != null) {
@@ -191,67 +190,54 @@ public class BasicJobQueue implements JobQueue {
             }
         }
 
-        @Override
         public Job getJob() {
             return status.getJob();
         }
 
-        @Override
         public JobStatus getStatus() {
             return status;
         }
 
-        @Override
         public long getJobId() {
             return status.getJobId();
         }
 
-        @Override
         public long getValidAtTime() {
             return validAtTime;
         }
 
-        @Override
         public void setValidAtTime(long validAtTime) {
             this.validAtTime = validAtTime;
         }
 
-        @Override
         public void incrementNetworkRetryCount() {
             networkRetryCount++;
         }
 
-        @Override
         public long getNetworkRetryBackoffMillis() {
             return networkBackoffPolicy.getNextMillis(networkRetryCount);
         }
 
-        @Override
         public void incrementGroupRetryCount() {
             groupRetryCount++;
         }
 
-        @Override
         public long getGroupRetryBackoffMillis() {
             return groupBackoffPolicy.getNextMillis(groupRetryCount);
         }
 
-        @Override
         public boolean isGroupMember() {
             return groupIndex >= 0 && status.getJob().getGroup() != null;
         }
 
-        @Override
         public int getGroupIndex() {
             return groupIndex;
         }
 
-        @Override
         public String getGroup() {
             return status.getJob().getGroup();
         }
 
-        @Override
         public boolean equals(JobQueueItem other) {
             if(other == null) {
                 return false;
