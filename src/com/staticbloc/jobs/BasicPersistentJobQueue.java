@@ -5,18 +5,11 @@ import android.content.Context;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
-/**
- * Created with IntelliJ IDEA.
- * User: eygraber
- * Date: 9/12/2014
- * Time: 6:29 PM
- * To change this template use File | Settings | File Templates.
- */
 public abstract class BasicPersistentJobQueue extends BasicJobQueue {
     private ExecutorService executor = Executors.newSingleThreadExecutor();
 
-    public BasicPersistentJobQueue(Context context) {
-        super(context);
+    BasicPersistentJobQueue(Context context, JobQueueInitializer initializer) {
+        super(context, initializer);
     }
 
     protected ExecutorService getPersistenceExecutor() {
@@ -24,7 +17,7 @@ public abstract class BasicPersistentJobQueue extends BasicJobQueue {
     }
 
     @Override
-    protected abstract void onLoadPersistedJobs();
+    protected abstract void onLoadPersistedData();
 
     @Override
     protected abstract void onPersistJobAdded(JobQueueItem job);

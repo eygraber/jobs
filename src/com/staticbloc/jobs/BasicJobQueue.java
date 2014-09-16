@@ -4,49 +4,130 @@ import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
+import android.content.SharedPreferences;
 import android.net.ConnectivityManager;
 import android.net.NetworkInfo;
 
 import java.util.*;
-import java.util.concurrent.PriorityBlockingQueue;
+import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 
 public class BasicJobQueue implements JobQueue {
-    private String name;
+    private static final String SHARED_PREFS_NAME = "com.staticbloc.jobs.%s";
+    private static final String SHARED_PREFS_JOB_ID_KEY = "job_id";
 
-    private PriorityBlockingQueue<JobQueueItem> queue;
+    private final String name;
 
-    private LinkedList<JobQueueItem> newJobs;
-    private LinkedList<JobQueueItem> futureJobs;
+    private PriorityBlockingQueue<JobRunnable> queue;
+    private JobExecutor executor;
+    private ScheduledExecutorService frozenJobExecutor;
+
     private Map<String, LinkedList<JobQueueItem>> groupMap;
-    private Map<Long, JobQueueItem> jobItemMap;
+    private Map<Long, JobRunnable> jobItemMap;
     private Map<String, Integer> groupIndexMap;
     private Set<Long> canceledJobs;
     private Set<String> inFlightUIDs;
 
     private final Object groupIndexMapLock = new Object();
 
+    private SharedPreferences sharedPrefs;
+
     private AtomicLong nextJobId;
-    private AtomicBoolean shouldCancelAll;
+    private AtomicBoolean isGroupsReady;
     private AtomicBoolean isConnectedToNetwork;
 
-    public BasicJobQueue(Context context) {
-        queue = new PriorityBlockingQueue<>(15, new JobComparator());
+    private JobQueueEventListener externalEventListener;
 
-        newJobs = new LinkedList<>();
-        futureJobs = new LinkedList<>();
+    private Context context;
+    private BroadcastReceiver networkStatusReceiver;
+
+    private static class JobExecutor {
+        private AtomicBoolean isShutdown = new AtomicBoolean(false);
+        private ThreadPoolExecutor executor;
+
+        // suppress unchecked warnings because we can't cast
+        // PriorityBlockingQueue<JobRunnable> to BlockingQueue<Runnable>
+        // http://stackoverflow.com/questions/25865910/java-blockingqueuerunnable-inconvertible-types
+        @SuppressWarnings("unchecked")
+        public JobExecutor(final String queueName, int corePoolSize, int maximumPoolSize, long keepAliveTime,
+                           PriorityBlockingQueue<JobRunnable> workQueue) {
+            executor = new ThreadPoolExecutor(corePoolSize, maximumPoolSize, keepAliveTime, TimeUnit.MILLISECONDS,
+                    (BlockingQueue) workQueue, new ThreadFactory() {
+                @Override
+                public Thread newThread(Runnable r) {
+                    return new Thread(r, queueName);
+                }
+            });
+            executor.allowCoreThreadTimeOut(false);
+        }
+
+        public boolean remove(JobRunnable runnable) {
+            if(!isShutdown.get()) {
+                return executor.remove(runnable);
+            }
+            else {
+                return true;
+            }
+        }
+
+        public void shutdownNow() {
+            if(!isShutdown.getAndSet(true)) {
+                executor.shutdownNow();
+            }
+        }
+    }
+
+    public BasicJobQueue(Context context, JobQueueInitializer initializer) {
+        if(initializer.getName() == null) {
+            throw new IllegalArgumentException("JobQueueInitializer must provide a non-null name");
+        }
+        this.name = initializer.getName();
+
+        if(context == null || context.getApplicationContext() == null) {
+            throw new IllegalArgumentException(("Context must not be null"));
+        }
+        this.context = context.getApplicationContext();
+
+        this.sharedPrefs = this.context.getSharedPreferences(
+                String.format(SHARED_PREFS_NAME, getName()), Context.MODE_PRIVATE);
+
+        queue = new PriorityBlockingQueue<>(15, new JobComparator());
+        executor = new JobExecutor(name, initializer.getMinLiveConsumers(), initializer.getMaxLiveConsumers(),
+                initializer.getConsumerKeepAliveSeconds(), queue);
+        frozenJobExecutor = Executors.newSingleThreadScheduledExecutor();
+
+        this.externalEventListener = initializer.getJobQueueEventListener();
+
         groupMap = new HashMap<>();
         jobItemMap = new HashMap<>();
         groupIndexMap = new HashMap<>();
         canceledJobs = new HashSet<>();
         inFlightUIDs = new HashSet<>();
 
-        nextJobId = new AtomicLong(0);
-        shouldCancelAll = new AtomicBoolean(false);
+        nextJobId = loadNextJobId();
+        isGroupsReady = new AtomicBoolean(false);
         isConnectedToNetwork = new AtomicBoolean(false);
 
-        initNetworkConnectionChecker(context);
+        initNetworkConnectionChecker();
+
+        onLoadPersistedData();
+    }
+
+    private AtomicLong loadNextJobId() {
+        return new AtomicLong(sharedPrefs.getLong(SHARED_PREFS_JOB_ID_KEY, 0));
+    }
+
+    /**
+     * This method is synchronized to ensure that there is no interleaving when
+     * storing the next id in shared preferences.
+     * This method could end up being called from the main thread, but it shouldn't
+     * be a problem.
+     */
+    private synchronized long incrementJobId() {
+        long id = nextJobId.getAndIncrement();
+        sharedPrefs.edit().putLong(SHARED_PREFS_JOB_ID_KEY, nextJobId.get()).apply();
+        return id;
     }
 
     @Override
@@ -62,15 +143,14 @@ public class BasicJobQueue implements JobQueue {
 
         JobStatus status;
         if(job.areMultipleInstancesAllowed() || !inFlightUIDs.contains(job.getUID())) {
-            status = new JobStatus(nextJobId.getAndIncrement(), job);
+            status = new JobStatus(incrementJobId(), job);
             JobQueueItem jobQueueItem = new JobQueueItem(status);
-            newJobs.addLast(jobQueueItem);
+            JobRunnable runnable = new JobRunnable(jobQueueItem);
+            queue.add(runnable);
             status.setState(JobStatus.State.ADDED);
-            if(job.isPersistent()) {
-                onPersistJobAdded(jobQueueItem);
-            }
+            onJobAdded(jobQueueItem);
             inFlightUIDs.add(job.getUID());
-            jobItemMap.put(status.getJobId(), jobQueueItem);
+            jobItemMap.put(status.getJobId(), runnable);
         }
         else {
             status = new JobStatus(JobStatus.IDENTICAL_JOB_REJECTED);
@@ -86,15 +166,14 @@ public class BasicJobQueue implements JobQueue {
 
         JobStatus status;
         if(job.areMultipleInstancesAllowed() || !inFlightUIDs.contains(job.getUID())) {
-            status = new JobStatus(nextJobId.getAndIncrement(), job);
+            status = new JobStatus(incrementJobId(), job);
             JobQueueItem jobQueueItem = new JobQueueItem(status, System.currentTimeMillis() + delayMillis);
-            futureJobs.addLast(jobQueueItem);
+            JobRunnable runnable = new JobRunnable(jobQueueItem);
+            frozenJobExecutor.schedule(new FrozenJobRunnable(runnable), delayMillis, TimeUnit.MILLISECONDS);
             status.setState(JobStatus.State.COLD_STORAGE);
-            if(job.isPersistent()) {
-                onPersistJobAdded(jobQueueItem);
-            }
+            onJobAdded(jobQueueItem);
             inFlightUIDs.add(job.getUID());
-            jobItemMap.put(status.getJobId(), jobQueueItem);
+            jobItemMap.put(status.getJobId(), runnable);
         }
         else {
             status = new JobStatus(JobStatus.IDENTICAL_JOB_REJECTED);
@@ -102,43 +181,48 @@ public class BasicJobQueue implements JobQueue {
         return status;
     }
 
-    private void moveNewJobsToQueue() {
-        while(!newJobs.isEmpty()) {
-            JobQueueItem job = newJobs.getFirst();
-            if(job != null) {
-                queue.add(job);
+    private void internalAddToQueueOrColdStorage(JobRunnable jobRunnable) {
+        JobQueueItem job = jobRunnable.getJob();
+        if(job != null) {
+            if(job.getValidAtTime() <= System.currentTimeMillis()) {
                 job.getStatus().setState(JobStatus.State.QUEUED);
-                if(job.getJob().isPersistent()) {
-                    onPersistJobModified(job);
-                }
+                queue.add(jobRunnable);
             }
-        }
-    }
-
-    private void moveFutureJobsToQueueIfReady() {
-        while(!futureJobs.isEmpty()) {
-            JobQueueItem job = futureJobs.getFirst();
-            if(job != null && job.getValidAtTime() <= System.currentTimeMillis()) {
-                queue.add(job);
-                job.getStatus().setState(JobStatus.State.QUEUED);
-                if(job.getJob().isPersistent()) {
-                    onPersistJobModified(job);
-                }
+            else {
+                job.getStatus().setState(JobStatus.State.COLD_STORAGE);
+                frozenJobExecutor.schedule(new FrozenJobRunnable(jobRunnable),
+                        job.getValidAtTime() - System.currentTimeMillis(), TimeUnit.MILLISECONDS);
             }
         }
     }
 
     @Override
     public final void cancel(long jobId) {
-        JobQueueItem jobQueueItem = jobItemMap.get(jobId);
-        if(jobQueueItem != null) {
-            JobStatus status = jobQueueItem.getStatus();
-            if(status != null) {
-                Job job = status.getJob();
-                if(job != null) {
-                    canceledJobs.add(jobId);
-                    if(job.isPersistent()) {
-                        onPersistJobRemoved(jobQueueItem);
+        JobRunnable runnable = jobItemMap.get(jobId);
+        if(runnable != null) {
+            JobQueueItem jobQueueItem = runnable.getJob();
+            if(executor.remove(runnable)) {
+                if(jobQueueItem != null) {
+                    JobStatus status = jobQueueItem.getStatus();
+                    if(status != null) {
+                        Job job = status.getJob();
+                        if(job != null) {
+                            try {
+                                job.onCanceled();
+                            } catch(Throwable ignore) {}
+                            onJobRemoved(jobQueueItem);
+                        }
+                    }
+                }
+            }
+            else {
+                if(jobQueueItem != null) {
+                    JobStatus status = jobQueueItem.getStatus();
+                    if(status != null) {
+                        Job job = status.getJob();
+                        if(job != null) {
+                            canceledJobs.add(status.getJobId());
+                        }
                     }
                 }
             }
@@ -147,30 +231,37 @@ public class BasicJobQueue implements JobQueue {
 
     @Override
     public final void cancelAll() {
-        shouldCancelAll.set(true);
-        onPersistAllJobsCanceled();
-    }
-
-    private void clearAll() {
         queue.clear();
-        newJobs.clear();
-        ArrayList<Long> jobStatusKeys = new ArrayList<Long>(jobItemMap.keySet());
+        ArrayList<Long> jobStatusKeys = new ArrayList<>(jobItemMap.keySet());
         for (Long id : jobStatusKeys) {
-            JobQueueItem jobQueueItem = jobItemMap.get(id);
-            if(jobQueueItem != null && jobQueueItem.getStatus() != null) {
-                jobQueueItem.getStatus().setState(JobStatus.State.CANCELED);
+            JobRunnable runnable = jobItemMap.get(id);
+            if(runnable != null) {
+                JobQueueItem jobQueueItem = runnable.getJob();
+                if(jobQueueItem != null && jobQueueItem.getStatus() != null) {
+                    jobQueueItem.getStatus().setState(JobStatus.State.CANCELED);
+                }
             }
         }
         jobItemMap.clear();
         canceledJobs.clear();
         inFlightUIDs.clear();
+        onPersistAllJobsCanceled();
+        if(externalEventListener != null) {
+            externalEventListener.onAllJobsCanceled();
+        }
     }
 
     @Override
     public final JobStatus getStatus(long jobId) {
-        JobQueueItem jobQueueItem = jobItemMap.get(jobId);
-        if(jobQueueItem != null) {
-            return jobQueueItem.getStatus();
+        JobRunnable runnable = jobItemMap.get(jobId);
+        if(runnable != null) {
+            JobQueueItem jobQueueItem = runnable.getJob();
+            if(jobQueueItem != null) {
+                return jobQueueItem.getStatus();
+            }
+            else {
+                return null;
+            }
         }
         else {
             return null;
@@ -184,32 +275,73 @@ public class BasicJobQueue implements JobQueue {
 
     @Override
     public final void shutdown(boolean keepPersisted) {
-        // TODO: implement
+        // TODO: after shutdown all public calls should throw IllegalStateException
+        executor.shutdownNow();
+        frozenJobExecutor.shutdownNow();
+
+        if(networkStatusReceiver != null) {
+            try {
+                context.unregisterReceiver(networkStatusReceiver);
+            } catch(Exception ignore) {}
+        }
+
+        if(externalEventListener != null) {
+            externalEventListener.onShutdown(keepPersisted);
+        }
     }
 
     /**
-     * Should only be called by subclasses of {@link BasicJobQueue} from {@link BasicJobQueue#onLoadPersistedJobs()}.
+     * Should only be called by subclasses of {@link BasicJobQueue} from {@link BasicJobQueue#onLoadPersistedData()}.
      * Adds a {@link java.util.List} of persisted {@code Job}s to the queue.
      * @param jobs the {@code List} of loaded persisted {@code Job}s that need to be added to the queue.
      */
     protected final void addPersistedJobs(List<JobQueueItem> jobs) {
-        for(JobQueueItem job : jobs) {
-            if(job != null && job.getStatus() != null && job.getJob() != null) {
-                if(job.getJob().areMultipleInstancesAllowed() || !inFlightUIDs.contains(job.getJob().getUID())) {
-                    if(job.getValidAtTime() <= System.currentTimeMillis()) {
-                        queue.add(job);
-                        job.getStatus().setState(JobStatus.State.QUEUED);
+        if(jobs != null) {
+            for(JobQueueItem job : jobs) {
+                if(job != null && job.getStatus() != null && job.getJob() != null) {
+                    if(job.getJob().areMultipleInstancesAllowed() || !inFlightUIDs.contains(job.getJob().getUID())) {
+                        JobRunnable runnable = new JobRunnable(job);
+                        internalAddToQueueOrColdStorage(runnable);
+                        onJobModified(job);
+                        inFlightUIDs.add(job.getJob().getUID());
+                        jobItemMap.put(job.getJobId(), runnable);
                     }
-                    else {
-                        futureJobs.addLast(job);
-                        job.getStatus().setState(JobStatus.State.COLD_STORAGE);
-                    }
-                    onPersistJobModified(job);
-                    inFlightUIDs.add(job.getJob().getUID());
-                    jobItemMap.put(job.getJobId(), job);
                 }
             }
         }
+
+        if(externalEventListener != null) {
+            externalEventListener.onStarted();
+        }
+    }
+
+    /**
+     * Should only be called by subclasses of {@link BasicJobQueue} from {@link BasicJobQueue#onLoadPersistedData()}.
+     * Adds a {@link java.util.Map} of persisted groups to this {@code BasicJobQueue}.
+     * @param groupMap the {@code Map} of loaded persisted groups
+     */
+    protected final void addPersistedGroups(Map<String, LinkedList<JobQueueItem>> groupMap) {
+        if(groupMap != null) {
+            Set<String> groupNames = groupMap.keySet();
+            for(String groupName : groupNames) {
+                LinkedList<JobQueueItem> groupQueue = groupMap.get(groupName);
+                if(groupQueue != null && !groupQueue.isEmpty()) {
+                    if(this.groupMap.containsKey(groupName)) {
+                        LinkedList<JobQueueItem> currentGroupQueue = this.groupMap.get(groupName);
+                        if(currentGroupQueue != null) {
+                            for(JobQueueItem job : currentGroupQueue) {
+                                job.setGroupIndex(job.getGroupIndex() + groupQueue.size());
+                            }
+                            groupQueue.addAll(currentGroupQueue);
+                        }
+                    }
+                    this.groupIndexMap.put(groupName, groupQueue.size());
+                    this.groupMap.put(groupName, groupQueue);
+                }
+            }
+        }
+
+        isGroupsReady.set(true);
     }
 
     /**
@@ -218,7 +350,10 @@ public class BasicJobQueue implements JobQueue {
      *
      */
     @SuppressWarnings("unused")
-    protected void onLoadPersistedJobs() {/*Intentionally empty*/}
+    protected void onLoadPersistedData() {
+        addPersistedJobs(null);
+        addPersistedGroups(null);
+    }
 
     /**
      * Called when a {@link Job} is added via the public API.
@@ -251,6 +386,34 @@ public class BasicJobQueue implements JobQueue {
      */
     @SuppressWarnings("unused")
     protected void onPersistJobModified(JobQueueItem job) {/*Intentionally empty*/}
+
+    private void onJobAdded(JobQueueItem job) {
+        if(externalEventListener != null) {
+            externalEventListener.onJobAdded(job.getStatus());
+        }
+        if(job.getJob().isPersistent()) {
+            onPersistJobAdded(job);
+        }
+    }
+
+    private void onJobRemoved(JobQueueItem job) {
+        inFlightUIDs.remove(job.getJob().getUID());
+        if(externalEventListener != null) {
+            externalEventListener.onJobRemoved(job.getStatus());
+        }
+        if(job.getJob().isPersistent()) {
+            onPersistJobRemoved(job);
+        }
+    }
+
+    private void onJobModified(JobQueueItem job) {
+        if(externalEventListener != null) {
+            externalEventListener.onJobModified(job.getStatus());
+        }
+        if(job.getJob().isPersistent()) {
+            onPersistJobModified(job);
+        }
+    }
 
     protected final class JobQueueItem {
         private long validAtTime;
@@ -337,6 +500,14 @@ public class BasicJobQueue implements JobQueue {
             return groupIndex;
         }
 
+        /**
+         * This should only be called when we load persisted group data
+         * @param groupIndex the newly calculated group index
+         */
+        private void setGroupIndex(int groupIndex) {
+            this.groupIndex = groupIndex;
+        }
+
         public String getGroup() {
             return status.getJob().getGroup();
         }
@@ -351,200 +522,156 @@ public class BasicJobQueue implements JobQueue {
         }
     }
 
-    private static class JobComparator implements Comparator<JobQueueItem> {
+    private static class JobComparator implements Comparator<JobRunnable> {
         @Override
-        public int compare(JobQueueItem lhs, JobQueueItem rhs) {
+        public int compare(JobRunnable lhs, JobRunnable rhs) {
             // we shouldn't have to check JobWrappers for null because PriorityBlockingQueues don't allow null
-            Job lhsJob = lhs.getJob();
-            Job rhsJob = rhs.getJob();
-            if(lhsJob == null) {
-                if(rhsJob == null) {
+            JobQueueItem lhsJob = lhs.getJob();
+            JobQueueItem rhsJob = rhs.getJob();
+            if(lhsJob == null || lhsJob.getJob() == null) {
+                if(rhsJob == null || rhsJob.getJob() == null) {
                     return 0;
                 }
                 else {
                     return -1;
                 }
             }
-            else if(rhsJob == null) {
+            else if(rhsJob == null || rhsJob.getJob() == null) {
                 return 1;
             }
             else {
-                if(lhs.isGroupMember() && rhs.isGroupMember()) {
+                if(lhsJob.isGroupMember() && rhsJob.isGroupMember()) {
                     if(lhsJob.getGroup().equals(rhsJob.getGroup())) {
-                        return rhs.getGroupIndex() - lhs.getGroupIndex();
+                        return rhsJob.getGroupIndex() - lhs.getJob().getGroupIndex();
                     }
                 }
 
-                return lhsJob.getPriority() - rhsJob.getPriority();
+                return lhsJob.getJob().getPriority() - rhsJob.getJob().getPriority();
             }
         }
     }
 
-    private class QueueThread extends Thread {
-        private boolean keepRunning = true;
+    private class JobRunnable implements Runnable {
+        private JobQueueItem job;
 
-        public void stopRunning() {
-            keepRunning = false;
+        public JobRunnable(JobQueueItem job) {
+            this.job = job;
+        }
+
+        public JobQueueItem getJob() {
+            return job;
         }
 
         @Override
         public void run() {
-            while(keepRunning) {
-                // if we got an API request to clear all of the jobs,
-                // do it here, otherwise take some time to add new and
-                // frozen jobs to the queue
-                if(shouldCancelAll.get()) {
-                    clearAll();
-                    shouldCancelAll.set(false);
-                }
-                else {
-                    moveNewJobsToQueue();
-                    moveFutureJobsToQueueIfReady();
-                }
-
-                JobQueueItem job;
+            // if this specific job was canceled ignore it
+            if(canceledJobs.contains(job.getJobId())) {
+                job.getStatus().setState(JobStatus.State.CANCELED);
                 try {
-                    job = queue.take();
-                } catch (InterruptedException e) {
-                    continue;
-                }
+                    job.getJob().onCanceled();
+                } catch(Throwable ignore) {}
+                canceledJobs.remove(job.getJobId());
+                onJobRemoved(job);
+                return;
+            }
 
-                // if we got an API request to clear all of the jobs while
-                // we were waiting to consume a job,
-                // do it here, otherwise take some time to add new and
-                // frozen jobs to the queue
-                if(shouldCancelAll.get()) {
-                    clearAll();
-                    shouldCancelAll.set(false);
-                    continue;
-                }
-                else {
-                    moveNewJobsToQueue();
-                    moveFutureJobsToQueueIfReady();
-                }
+            // ensure that the job can reach its required networks if it has any
+            if(job.getJob().requiresNetwork()) {
+                try {
+                    if(!isConnectedToNetwork.get() || !job.getJob().canReachRequiredNetwork()) {
+                        job.incrementNetworkRetryCount();
+                        job.setValidAtTime(System.currentTimeMillis() + job.getNetworkRetryBackoffMillis());
+                        internalAddToQueueOrColdStorage(this);
+                        onJobModified(job);
+                        return;
+                    }
+                } catch(Throwable ignore) {}
+            }
 
-                // if this specific job was canceled ignore it
-                if(canceledJobs.contains(job.getJobId())) {
-                    job.getStatus().setState(JobStatus.State.CANCELED);
-                    try {
-                        job.getJob().onCanceled();
-                    } catch(Throwable ignore) {}
-                    canceledJobs.remove(job.getJobId());
-                    continue;
-                }
-
-                // ensure that the job can reach its required networks if it has any
-                if(job.getJob().requiresNetwork()) {
-                    try {
-                        if(!isConnectedToNetwork.get() || !job.getJob().canReachRequiredNetwork()) {
-                            job.incrementNetworkRetryCount();
-                            job.setValidAtTime(System.currentTimeMillis() + job.getNetworkRetryBackoffMillis());
-                            job.getStatus().setState(JobStatus.State.COLD_STORAGE);
-                            if(job.getJob().isPersistent()) {
-                                onPersistJobModified(job);
-                            }
-                            futureJobs.addLast(job);
-                            continue;
-                        }
-                    } catch(Throwable ignore) {}
-                }
-
-                // if this job is part of a group, ensure that it is the next job
-                // from that group that should be run
-                if(job.isGroupMember()) {
-                    LinkedList<JobQueueItem> groupQueue = groupMap.get(job.getGroup());
-                    // it should never be null
-                    if(groupQueue != null) {
-                        if(!job.equals(groupQueue.peekFirst())) {
-                            job.incrementGroupRetryCount();
-                            job.setValidAtTime(System.currentTimeMillis() + job.getGroupRetryBackoffMillis());
-                            job.getStatus().setState(JobStatus.State.COLD_STORAGE);
-                            if(job.getJob().isPersistent()) {
-                                onPersistJobModified(job);
-                            }
-                            futureJobs.addLast(job);
-                            continue;
-                        }
+            // if this job is part of a group, ensure that it is the next job
+            // from that group that should be run
+            if(job.isGroupMember()) {
+                LinkedList<JobQueueItem> groupQueue = groupMap.get(job.getGroup());
+                // it should never be null
+                if(groupQueue != null) {
+                    if(!isGroupsReady.get() || !job.equals(groupQueue.peekFirst())) {
+                        job.incrementGroupRetryCount();
+                        job.setValidAtTime(System.currentTimeMillis() + job.getGroupRetryBackoffMillis());
+                        internalAddToQueueOrColdStorage(this);
+                        onJobModified(job);
+                        return;
                     }
                 }
+            }
 
-                boolean retry = false;
-                do {
-                    try {
-                        job.getJob().performJob();
-                        if(job.getJob() instanceof Waitable) {
-                            ((Waitable) job.getJob()).await();
-                        }
-                        if(job.getJob().isPersistent()) {
-                            onPersistJobRemoved(job);
-                        }
-                        if(job.isGroupMember()) {
-                            popGroupQueue(job);
-                        }
+            boolean retry = false;
+            do {
+                try {
+                    job.getStatus().setState(JobStatus.State.ACTIVE);
+                    job.getJob().performJob();
+                    if(job.getJob() instanceof Waitable) {
+                        ((Waitable) job.getJob()).await();
                     }
-                    catch(Throwable e) {
-                        try {
-                            retry = job.getJob().onError(e);
-                        } catch(Throwable ignore) {
-                            // if onError throws a Throwable we don't retry it
+                    onJobRemoved(job);
+                    if(job.isGroupMember()) {
+                        popGroupQueue();
+                    }
+                    job.getStatus().setState(JobStatus.State.FINISHED);
+                }
+                catch(Throwable e) {
+                    try {
+                        retry = job.getJob().onError(e);
+                    } catch(Throwable ignore) {
+                        // if onError throws a Throwable we don't retry it
+                        retry = false;
+                    }
+                    if(retry) {
+                        job.getJob().incrementRetryCount();
+                        if(job.getJob().getRetryCount() >= job.getJob().getRetryLimit()) {
                             retry = false;
-                        }
-                        if(retry) {
-                            job.getJob().incrementRetryCount();
-                            if(job.getJob().getRetryCount() >= job.getJob().getRetryLimit()) {
-                                retry = false;
-                                try {
-                                    job.getJob().onRetryLimitReached();
-                                } catch(Throwable ignore) {}
-                                if(job.getJob().isPersistent()) {
-                                    onPersistJobRemoved(job);
-                                }
-                                if(job.isGroupMember()) {
-                                    popGroupQueue(job);
-                                }
-                            }
-                            else {
-                                try {
-                                    job.getJob().onRetry();
-                                } catch(Throwable ignore) {}
-                                long backoffMillis = job.getJob().getBackoffPolicy()
-                                                        .getNextMillis(job.getJob().getRetryCount());
-                                // if backoffMillis is 0 continue with the retry
-                                // if it's <= 1 second just sleep it off instead of reinserting into queue
-                                // otherwise update the timestamp and stick it back in the queue
-                                if(backoffMillis > 0 && backoffMillis <= 1000) {
-                                    try {
-                                        Thread.sleep(backoffMillis);
-                                    } catch (InterruptedException ignore) {}
-                                }
-                                else if(backoffMillis > 1000) {
-                                    retry = false;
-                                    job.setValidAtTime(System.currentTimeMillis() + backoffMillis);
-                                    job.getStatus().setState(JobStatus.State.COLD_STORAGE);
-                                    futureJobs.addLast(job);
-                                }
-                                if(job.getJob().isPersistent()) {
-                                    onPersistJobModified(job);
-                                }
+                            try {
+                                job.getJob().onRetryLimitReached();
+                            } catch(Throwable ignore) {}
+                            onJobRemoved(job);
+                            if(job.isGroupMember()) {
+                                popGroupQueue();
                             }
                         }
                         else {
-                            if(job.getJob().isPersistent()) {
-                                onPersistJobRemoved(job);
+                            try {
+                                job.getJob().onRetry();
+                            } catch(Throwable ignore) {}
+                            long backoffMillis = job.getJob().getBackoffPolicy()
+                                    .getNextMillis(job.getJob().getRetryCount());
+                            // if backoffMillis is 0 continue with the retry
+                            // if it's <= 1 second just sleep it off instead of reinserting into queue
+                            // otherwise update the timestamp and stick it back in the queue
+                            if(backoffMillis > 0 && backoffMillis <= 1000) {
+                                try {
+                                    Thread.sleep(backoffMillis);
+                                } catch (InterruptedException ignore) {}
                             }
-                            if(job.isGroupMember()) {
-                                popGroupQueue(job);
+                            else if(backoffMillis > 1000) {
+                                retry = false;
+                                job.setValidAtTime(System.currentTimeMillis() + backoffMillis);
+                                internalAddToQueueOrColdStorage(this);
                             }
+                            onJobModified(job);
                         }
                     }
-                } while(retry);
-
-            }
+                    else {
+                        onJobRemoved(job);
+                        if(job.isGroupMember()) {
+                            popGroupQueue();
+                        }
+                    }
+                }
+            } while(retry);
         }
 
-        private void popGroupQueue(JobQueueItem item) {
-            if(item.isGroupMember()) {
-                LinkedList<JobQueueItem> groupQueue = groupMap.get(item.getGroup());
+        private void popGroupQueue() {
+            if(job.isGroupMember()) {
+                LinkedList<JobQueueItem> groupQueue = groupMap.get(job.getGroup());
                 // it should never be null
                 if(groupQueue != null) {
                     // since we're the head of the queue
@@ -555,12 +682,23 @@ public class BasicJobQueue implements JobQueue {
         }
     }
 
-    private void initNetworkConnectionChecker(Context context) {
-        if(context == null || context.getApplicationContext() == null) {
-            throw new IllegalArgumentException("Cannot pass a null Context");
+    private class FrozenJobRunnable implements Runnable {
+        private JobRunnable jobRunnable;
+
+        public FrozenJobRunnable(JobRunnable jobRunnable) {
+            this.jobRunnable = jobRunnable;
         }
 
-        context.getApplicationContext().registerReceiver(new BroadcastReceiver() {
+        @Override
+        public void run() {
+            if(jobRunnable != null) {
+                internalAddToQueueOrColdStorage(jobRunnable);
+            }
+        }
+    }
+
+    private void initNetworkConnectionChecker() {
+        networkStatusReceiver = new BroadcastReceiver() {
             @Override
             public void onReceive(Context context, Intent intent) {
                 ConnectivityManager cm = (ConnectivityManager) context.getSystemService(Context.CONNECTIVITY_SERVICE);
@@ -572,7 +710,9 @@ public class BasicJobQueue implements JobQueue {
                     isConnectedToNetwork.set(false);
                 }
             }
-        }, new IntentFilter(ConnectivityManager.CONNECTIVITY_ACTION));
+        };
+        context.getApplicationContext().registerReceiver(networkStatusReceiver,
+                new IntentFilter(ConnectivityManager.CONNECTIVITY_ACTION));
         ConnectivityManager cm = (ConnectivityManager) context.getSystemService(Context.CONNECTIVITY_SERVICE);
         NetworkInfo netInfo = cm.getActiveNetworkInfo();
         if(netInfo != null) {

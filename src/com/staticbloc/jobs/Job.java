@@ -1,7 +1,7 @@
 package com.staticbloc.jobs;
 
 public interface Job {
-    public static final int NO_RETRY_LIMIT = -1;
+    public static final int NO_RETRY_LIMIT = Integer.MAX_VALUE;
 
     /**
      * Returns this {@link Job}'s priority. Higher is more important.
