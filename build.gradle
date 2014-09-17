@@ -49,4 +49,5 @@ dependencies {
     compile 'com.google.code.gson:gson:2.3'
 }
 
+// only applies if gradle was run with uploadArchives
 apply from: 'https://raw.githubusercontent.com/eygraber/gradle-mvn-push/master/gradle-mvn-push.gradle'
