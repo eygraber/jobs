@@ -14,32 +14,35 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 
 public class BasicJobQueue implements JobQueue {
-    private static final String SHARED_PREFS_NAME = "com.staticbloc.jobs.%s";
-    private static final String SHARED_PREFS_JOB_ID_KEY = "job_id";
+    private static final String SHARED_PREFS_NAME = "com.staticbloc.jobs.BasicJobQueuePrefs";
+    private static final String SHARED_PREFS_JOB_ID_KEY = "%s_job_id";
 
     private final String name;
 
-    private PriorityBlockingQueue<JobRunnable> queue;
-    private JobExecutor executor;
-    private ScheduledExecutorService frozenJobExecutor;
+    private final PriorityBlockingQueue<JobRunnable> queue;
+    private final JobExecutor executor;
+    private final ScheduledExecutorService frozenJobExecutor;
 
-    private Map<String, LinkedList<JobQueueItem>> groupMap;
-    private Map<Long, JobRunnable> jobItemMap;
-    private Map<String, Integer> groupIndexMap;
-    private Set<Long> canceledJobs;
-    private Set<String> inFlightUIDs;
+    private final Map<String, LinkedList<JobQueueItem>> groupMap;
+    private final Map<Long, JobRunnable> jobItemMap;
+    private final Map<String, Integer> groupIndexMap;
+    private final Set<Long> canceledJobs;
+    private final Set<String> inFlightUIDs;
+    private final LinkedList<JobQueueItem> queueNotReadyList;
 
     private final Object groupIndexMapLock = new Object();
 
-    private SharedPreferences sharedPrefs;
+    private final SharedPreferences sharedPrefs;
 
-    private AtomicLong nextJobId;
-    private AtomicBoolean isGroupsReady;
-    private AtomicBoolean isConnectedToNetwork;
+    private final AtomicLong nextJobId;
+    private final AtomicBoolean isQueueReady;
+    private final AtomicBoolean isConnectedToNetwork;
 
-    private JobQueueEventListener externalEventListener;
+    private boolean isShutdown;
 
-    private Context context;
+    private final JobQueueEventListener externalEventListener;
+
+    private final Context context;
     private BroadcastReceiver networkStatusReceiver;
 
     private static class JobExecutor {
@@ -89,25 +92,27 @@ public class BasicJobQueue implements JobQueue {
         }
         this.context = context.getApplicationContext();
 
-        this.sharedPrefs = this.context.getSharedPreferences(
-                String.format(SHARED_PREFS_NAME, getName()), Context.MODE_PRIVATE);
+        sharedPrefs = this.context.getSharedPreferences(SHARED_PREFS_NAME, Context.MODE_PRIVATE);
 
         queue = new PriorityBlockingQueue<>(15, new JobComparator());
         executor = new JobExecutor(name, initializer.getMinLiveConsumers(), initializer.getMaxLiveConsumers(),
                 initializer.getConsumerKeepAliveSeconds(), queue);
         frozenJobExecutor = Executors.newSingleThreadScheduledExecutor();
 
-        this.externalEventListener = initializer.getJobQueueEventListener();
+        externalEventListener = initializer.getJobQueueEventListener();
 
         groupMap = new HashMap<>();
         jobItemMap = new HashMap<>();
         groupIndexMap = new HashMap<>();
         canceledJobs = new HashSet<>();
         inFlightUIDs = new HashSet<>();
+        queueNotReadyList = new LinkedList<>();
 
         nextJobId = loadNextJobId();
-        isGroupsReady = new AtomicBoolean(false);
+        isQueueReady = new AtomicBoolean(false);
         isConnectedToNetwork = new AtomicBoolean(false);
+
+        isShutdown = false;
 
         initNetworkConnectionChecker();
 
@@ -115,7 +120,7 @@ public class BasicJobQueue implements JobQueue {
     }
 
     private AtomicLong loadNextJobId() {
-        return new AtomicLong(sharedPrefs.getLong(SHARED_PREFS_JOB_ID_KEY, 0));
+        return new AtomicLong(sharedPrefs.getLong(String.format(SHARED_PREFS_JOB_ID_KEY, getName()), 0));
     }
 
     /**
@@ -126,7 +131,7 @@ public class BasicJobQueue implements JobQueue {
      */
     private synchronized long incrementJobId() {
         long id = nextJobId.getAndIncrement();
-        sharedPrefs.edit().putLong(SHARED_PREFS_JOB_ID_KEY, nextJobId.get()).apply();
+        sharedPrefs.edit().putLong(String.format(SHARED_PREFS_JOB_ID_KEY, getName()), nextJobId.get()).apply();
         return id;
     }
 
@@ -137,29 +142,14 @@ public class BasicJobQueue implements JobQueue {
 
     @Override
     public final JobStatus add(Job job) {
-        if(job == null) {
-            throw new IllegalArgumentException("Can't pass a null Job");
-        }
-
-        JobStatus status;
-        if(job.areMultipleInstancesAllowed() || !inFlightUIDs.contains(job.getUID())) {
-            status = new JobStatus(incrementJobId(), job);
-            JobQueueItem jobQueueItem = new JobQueueItem(status);
-            JobRunnable runnable = new JobRunnable(jobQueueItem);
-            queue.add(runnable);
-            status.setState(JobStatus.State.ADDED);
-            onJobAdded(jobQueueItem);
-            inFlightUIDs.add(job.getUID());
-            jobItemMap.put(status.getJobId(), runnable);
-        }
-        else {
-            status = new JobStatus(JobStatus.IDENTICAL_JOB_REJECTED);
-        }
-        return status;
+        return add(job, 0);
     }
 
     @Override
     public final JobStatus add(Job job, long delayMillis) {
+        if(isShutdown) {
+            throw new IllegalStateException("Queue is shutdown");
+        }
         if(job == null) {
             throw new IllegalArgumentException("Can't pass a null Job");
         }
@@ -168,17 +158,56 @@ public class BasicJobQueue implements JobQueue {
         if(job.areMultipleInstancesAllowed() || !inFlightUIDs.contains(job.getUID())) {
             status = new JobStatus(incrementJobId(), job);
             JobQueueItem jobQueueItem = new JobQueueItem(status, System.currentTimeMillis() + delayMillis);
-            JobRunnable runnable = new JobRunnable(jobQueueItem);
-            frozenJobExecutor.schedule(new FrozenJobRunnable(runnable), delayMillis, TimeUnit.MILLISECONDS);
-            status.setState(JobStatus.State.COLD_STORAGE);
-            onJobAdded(jobQueueItem);
-            inFlightUIDs.add(job.getUID());
-            jobItemMap.put(status.getJobId(), runnable);
+            add(jobQueueItem);
         }
         else {
             status = new JobStatus(JobStatus.IDENTICAL_JOB_REJECTED);
         }
         return status;
+    }
+
+    private JobStatus add(JobQueueItem job) {
+        if(!isQueueReady.get()) {
+            synchronized(isQueueReady) {
+                if(!isQueueReady.get()) {
+                    job.getStatus().setState(JobStatus.State.QUEUE_NOT_READY);
+                    queueNotReadyList.addLast(job);
+                }
+            }
+        }
+        else {
+            String group = job.getGroup();
+            if(group != null) {
+                synchronized(groupIndexMapLock) {
+                    Integer groupIndex = groupIndexMap.get(group);
+                    LinkedList<JobQueueItem> groupQueue = groupMap.get(group);
+                    if(groupQueue == null) {
+                        groupQueue = new LinkedList<>();
+                        groupMap.put(group, groupQueue);
+                    }
+                    if(groupIndex == null || groupQueue.isEmpty()) {
+                        groupIndex = 0;
+                    }
+                    groupIndexMap.put(group, groupIndex + 1);
+                    job.setGroupIndex(groupIndex);
+                    groupQueue.addLast(job);
+                }
+            }
+            JobRunnable runnable = new JobRunnable(job);
+            long delayMillis = job.getValidAtTime() - System.currentTimeMillis();
+            if(delayMillis <= 0) {
+                job.getStatus().setState(JobStatus.State.ADDED);
+                queue.add(runnable);
+            }
+            else {
+                job.getStatus().setState(JobStatus.State.COLD_STORAGE);
+                frozenJobExecutor.schedule(new FrozenJobRunnable(runnable), delayMillis, TimeUnit.MILLISECONDS);
+            }
+            onJobAdded(job);
+            inFlightUIDs.add(job.getJob().getUID());
+            jobItemMap.put(job.getStatus().getJobId(), runnable);
+        }
+        return job.getStatus();
     }
 
     private void internalAddToQueueOrColdStorage(JobRunnable jobRunnable) {
@@ -198,6 +227,9 @@ public class BasicJobQueue implements JobQueue {
 
     @Override
     public final void cancel(long jobId) {
+        if(isShutdown) {
+            throw new IllegalStateException("Queue is shutdown");
+        }
         JobRunnable runnable = jobItemMap.get(jobId);
         if(runnable != null) {
             JobQueueItem jobQueueItem = runnable.getJob();
@@ -231,6 +263,9 @@ public class BasicJobQueue implements JobQueue {
 
     @Override
     public final void cancelAll() {
+        if(isShutdown) {
+            throw new IllegalStateException("Queue is shutdown");
+        }
         queue.clear();
         ArrayList<Long> jobStatusKeys = new ArrayList<>(jobItemMap.keySet());
         for (Long id : jobStatusKeys) {
@@ -253,6 +288,9 @@ public class BasicJobQueue implements JobQueue {
 
     @Override
     public final JobStatus getStatus(long jobId) {
+        if(isShutdown) {
+            throw new IllegalStateException("Queue is shutdown");
+        }
         JobRunnable runnable = jobItemMap.get(jobId);
         if(runnable != null) {
             JobQueueItem jobQueueItem = runnable.getJob();
@@ -275,7 +313,12 @@ public class BasicJobQueue implements JobQueue {
 
     @Override
     public final void shutdown(boolean keepPersisted) {
-        // TODO: after shutdown all public calls should throw IllegalStateException
+        if(isShutdown) {
+            throw new IllegalStateException("Queue is shutdown");
+        }
+
+        isShutdown = true;
+
         executor.shutdownNow();
         frozenJobExecutor.shutdownNow();
 
@@ -305,43 +348,59 @@ public class BasicJobQueue implements JobQueue {
                         onJobModified(job);
                         inFlightUIDs.add(job.getJob().getUID());
                         jobItemMap.put(job.getJobId(), runnable);
+                        if(job.isGroupMember()) {
+                            LinkedList<JobQueueItem> groupQueue = groupMap.get(job.getGroup());
+                            if(groupQueue == null) {
+                                groupQueue = new LinkedList<>();
+                            }
+                            groupQueue.addLast(job);
+                            groupMap.put(job.getGroup(), groupQueue);
+                        }
                     }
                 }
             }
+
+            Set<String> groupKeys = groupMap.keySet();
+            for(String group: groupKeys) {
+                LinkedList<JobQueueItem> groupQueue = groupMap.get(group);
+                if(groupQueue != null) {
+                    Collections.sort(groupQueue, new Comparator<JobQueueItem>() {
+                        @Override
+                        public int compare(JobQueueItem lhs, JobQueueItem rhs) {
+                            if(lhs == null) {
+                                if(rhs == null) {
+                                    return 0;
+                                }
+                                else {
+                                    return -1;
+                                }
+                            }
+                            else if(rhs == null) {
+                                return 1;
+                            }
+                            else {
+                                return lhs.getGroupIndex() - rhs.getGroupIndex();
+                            }
+                        }
+                    });
+                    groupMap.put(group, groupQueue);
+                    groupIndexMap.put(group, groupQueue.size());
+                }
+            }
+        }
+
+        synchronized(isQueueReady) {
+            for(JobQueueItem job : queueNotReadyList) {
+                if(job.getJob().areMultipleInstancesAllowed() || !inFlightUIDs.contains(job.getJob().getUID())) {
+                    add(job);
+                }
+            }
+            isQueueReady.set(true);
         }
 
         if(externalEventListener != null) {
             externalEventListener.onStarted();
         }
-    }
-
-    /**
-     * Should only be called by subclasses of {@link BasicJobQueue} from {@link BasicJobQueue#onLoadPersistedData()}.
-     * Adds a {@link java.util.Map} of persisted groups to this {@code BasicJobQueue}.
-     * @param groupMap the {@code Map} of loaded persisted groups
-     */
-    protected final void addPersistedGroups(Map<String, LinkedList<JobQueueItem>> groupMap) {
-        if(groupMap != null) {
-            Set<String> groupNames = groupMap.keySet();
-            for(String groupName : groupNames) {
-                LinkedList<JobQueueItem> groupQueue = groupMap.get(groupName);
-                if(groupQueue != null && !groupQueue.isEmpty()) {
-                    if(this.groupMap.containsKey(groupName)) {
-                        LinkedList<JobQueueItem> currentGroupQueue = this.groupMap.get(groupName);
-                        if(currentGroupQueue != null) {
-                            for(JobQueueItem job : currentGroupQueue) {
-                                job.setGroupIndex(job.getGroupIndex() + groupQueue.size());
-                            }
-                            groupQueue.addAll(currentGroupQueue);
-                        }
-                    }
-                    this.groupIndexMap.put(groupName, groupQueue.size());
-                    this.groupMap.put(groupName, groupQueue);
-                }
-            }
-        }
-
-        isGroupsReady.set(true);
     }
 
     /**
@@ -352,7 +411,6 @@ public class BasicJobQueue implements JobQueue {
     @SuppressWarnings("unused")
     protected void onLoadPersistedData() {
         addPersistedJobs(null);
-        addPersistedGroups(null);
     }
 
     /**
@@ -432,28 +490,6 @@ public class BasicJobQueue implements JobQueue {
         public JobQueueItem(JobStatus status, long validAtTime) {
             this.status = status;
             this.validAtTime = validAtTime;
-
-            String group = status.getJob().getGroup();
-            if(group != null) {
-                /**
-                 * WARNING: this gets called on the main thread, but the ops in the synchronized block should be
-                 * small enough that it's not a big deal.
-                 */
-                synchronized(groupIndexMapLock) {
-                    Integer index = groupIndexMap.get(group);
-                    LinkedList<JobQueueItem> groupQueue = groupMap.get(group);
-                    if(groupQueue == null) {
-                        groupQueue = new LinkedList<>();
-                        groupMap.put(group, groupQueue);
-                    }
-                    if(index == null || groupQueue.isEmpty()) {
-                        index = 0;
-                    }
-                    groupIndexMap.put(group, index + 1);
-                    this.groupIndex = index;
-                    groupQueue.addLast(this);
-                }
-            }
         }
 
         public Job getJob() {
@@ -594,7 +630,7 @@ public class BasicJobQueue implements JobQueue {
                 LinkedList<JobQueueItem> groupQueue = groupMap.get(job.getGroup());
                 // it should never be null
                 if(groupQueue != null) {
-                    if(!isGroupsReady.get() || !job.equals(groupQueue.peekFirst())) {
+                    if(!job.equals(groupQueue.peekFirst())) {
                         job.incrementGroupRetryCount();
                         job.setValidAtTime(System.currentTimeMillis() + job.getGroupRetryBackoffMillis());
                         internalAddToQueueOrColdStorage(this);

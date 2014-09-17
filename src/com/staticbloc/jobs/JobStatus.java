@@ -13,6 +13,7 @@ public class JobStatus {
 
     public static enum State {
         NOTHING,
+        QUEUE_NOT_READY,
         ADDED,
         COLD_STORAGE,
         CANCELED,
