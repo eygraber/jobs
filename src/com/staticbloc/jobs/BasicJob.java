@@ -1,5 +1,7 @@
 package com.staticbloc.jobs;
 
+import java.util.HashSet;
+import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 
 public abstract class BasicJob implements Job, Waitable {
@@ -16,8 +18,10 @@ public abstract class BasicJob implements Job, Waitable {
 
     private CountDownLatch awaiter;
 
+    private Set<Object> subsections;
+
     /**
-     * Will create a {@code BasiJob} using the defaults from {@link JobInitializer}.
+     * Will create a {@code BasicJob} using the defaults from {@link JobInitializer}.
      */
     public BasicJob() {
         this(new JobInitializer());
@@ -40,6 +44,8 @@ public abstract class BasicJob implements Job, Waitable {
         if(getInitialLockCount() > 0) {
             awaiter = new CountDownLatch(getInitialLockCount());
         }
+
+        subsections = new HashSet<Object>();
     }
 
     /**
@@ -144,5 +150,86 @@ public abstract class BasicJob implements Job, Waitable {
         if(awaiter != null) {
             awaiter.countDown();
         }
+    }
+
+    /**
+     * Check if a subsection of this {@code BasicJob}'s code is complete. This is useful
+     * when code should not be run more than once in a {@code BasicJob} even after a retry (such
+     * as a mutating network call). Subsections are on a per-instance basis, and will be persisted
+     * if needed.<br />
+     *
+     * Typical usage is:
+     * <pre>
+     * {@code
+     *
+     * public class MyBasicJob extends BasicJob {
+     *     Object subsection2 = new Object();
+     *
+     *     public void performJob() {
+     *         if(!isSubsectionComplete("subsection1") {
+     *             // do something
+     *             setSubsectionComplete("test");
+     *         }
+     *         if(!isSubsectionComplete(subsection2)) {
+     *             // do something
+     *             setSubsectionComplete(subsection2);
+     *         }
+     *     }
+     * }
+     * }
+     * </pre>
+     * @param subsectionKey an {@code Object} that functions as a key to identify a subsection
+     * @see BasicJob#isSubsectionComplete(Object)
+     */
+    protected final boolean isSubsectionComplete(Object subsectionKey) {
+        return subsections.contains(subsectionKey);
+    }
+
+    /**
+     * Mark a subsection of this {@code BasicJob}'s code as being complete. This is useful
+     * when code should not be run more than once in a {@code BasicJob} even after a retry (such
+     * as a mutating network call). Subsections are on a per-instance basis, and will be persisted
+     * if needed.<br /><br />
+     *
+     * Typical usage is:
+     * <pre>
+     * {@code
+     *
+     * public class MyBasicJob extends BasicJob {
+     *     Object subsection2 = new Object();
+     *
+     *     public void performJob() {
+     *         if(!isSubsectionComplete("subsection1") {
+     *             // do something
+     *             setSubsectionComplete("test");
+     *         }
+     *         if(!isSubsectionComplete(subsection2)) {
+     *             // do something
+     *             setSubsectionComplete(subsection2);
+     *         }
+     *     }
+     * }
+     * }
+     * </pre>
+     * @param subsectionKey an {@code Object} that functions as a key to identify a subsection
+     * @see BasicJob#isSubsectionComplete(Object)
+     */
+    protected final void setSubsectionComplete(Object subsectionKey) {
+        subsections.add(subsectionKey);
+    }
+
+    /**
+     * Marks a subsection of this {@code BasicJob}'s code as being incomplete.
+     * @param subsectionKey an {@code Object} that functions as a key to identify a subsection
+     */
+    protected final void clearSubsection(Object subsectionKey) {
+        subsections.remove(subsectionKey);
+    }
+
+    /**
+     * Marks all subsections of this {@code BasicJob}'s code as being incomplete.
+     */
+    protected final void clearAllSubsections() {
+        subsections.clear();
     }
 }
