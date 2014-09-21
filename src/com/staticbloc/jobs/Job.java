@@ -111,4 +111,16 @@ public interface Job {
      * Called if we need to retry, but {@code getRetryCount() >= getRetryLimit()}.
      */
     public void onRetryLimitReached();
+
+    public static enum State {
+        NOTHING,
+        IDENTICAL_JOB_REJECTED,
+        QUEUE_NOT_READY,
+        ADDED,
+        COLD_STORAGE,
+        CANCELED,
+        QUEUED,
+        ACTIVE,
+        FINISHED
+    }
 }

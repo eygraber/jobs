@@ -4,18 +4,15 @@ import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
-import android.content.SharedPreferences;
 import android.net.ConnectivityManager;
 import android.net.NetworkInfo;
 
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.atomic.AtomicLong;
 
 public class BasicJobQueue implements JobQueue {
-    private static final String SHARED_PREFS_NAME = "com.staticbloc.jobs.BasicJobQueuePrefs";
-    private static final String SHARED_PREFS_JOB_ID_KEY = "%s_job_id";
+    private static final Set<String> activeQueues = Collections.synchronizedSet(new HashSet<String>());
 
     private final String name;
 
@@ -24,17 +21,14 @@ public class BasicJobQueue implements JobQueue {
     private final ScheduledExecutorService frozenJobExecutor;
 
     private final Map<String, LinkedList<JobQueueItem>> groupMap;
-    private final Map<Long, JobRunnable> jobItemMap;
+    private final Map<Job, JobRunnable> jobItemMap;
     private final Map<String, Integer> groupIndexMap;
-    private final Set<Long> canceledJobs;
+    private final Set<Job> canceledJobs;
     private final Set<String> inFlightUIDs;
     private final LinkedList<JobQueueItem> queueNotReadyList;
 
     private final Object groupIndexMapLock = new Object();
 
-    private final SharedPreferences sharedPrefs;
-
-    private final AtomicLong nextJobId;
     private final AtomicBoolean isQueueReady;
     private final AtomicBoolean isConnectedToNetwork;
 
@@ -81,9 +75,29 @@ public class BasicJobQueue implements JobQueue {
         }
     }
 
+    /**
+     * Creates a new {@code BasicJobQueue}.
+     * @param context a {@link android.content.Context} (will be stored as {@code context.getApplicationContext})
+     * @param initializer a {@link JobQueueInitializer} containing initialization parameters
+     *                    for this {@code BasicJobQueue}
+     *
+     * @throws java.lang.IllegalArgumentException if {@code initializer.getName() == null}
+     * @throws java.lang.IllegalStateException if a {@code BasicJobQueue} with this name is currently active
+     */
     public BasicJobQueue(Context context, JobQueueInitializer initializer) {
         if(initializer.getName() == null) {
             throw new IllegalArgumentException("JobQueueInitializer must provide a non-null name");
+        }
+        else {
+            synchronized (activeQueues) {
+                if(activeQueues.contains(initializer.getName())) {
+                    throw new IllegalStateException(String.format("There is already an active queue with name %s",
+                                                                    initializer.getName()));
+                }
+                else {
+                    activeQueues.add(initializer.getName());
+                }
+            }
         }
         this.name = initializer.getName();
 
@@ -91,8 +105,6 @@ public class BasicJobQueue implements JobQueue {
             throw new IllegalArgumentException(("Context must not be null"));
         }
         this.context = context.getApplicationContext();
-
-        sharedPrefs = this.context.getSharedPreferences(SHARED_PREFS_NAME, Context.MODE_PRIVATE);
 
         queue = new PriorityBlockingQueue<>(15, new JobComparator());
         executor = new JobExecutor(name, initializer.getMinLiveConsumers(), initializer.getMaxLiveConsumers(),
@@ -108,7 +120,6 @@ public class BasicJobQueue implements JobQueue {
         inFlightUIDs = new HashSet<>();
         queueNotReadyList = new LinkedList<>();
 
-        nextJobId = loadNextJobId();
         isQueueReady = new AtomicBoolean(false);
         isConnectedToNetwork = new AtomicBoolean(false);
 
@@ -119,34 +130,18 @@ public class BasicJobQueue implements JobQueue {
         onLoadPersistedData();
     }
 
-    private AtomicLong loadNextJobId() {
-        return new AtomicLong(sharedPrefs.getLong(String.format(SHARED_PREFS_JOB_ID_KEY, getName()), 0));
-    }
-
-    /**
-     * This method is synchronized to ensure that there is no interleaving when
-     * storing the next id in shared preferences.
-     * This method could end up being called from the main thread, but it shouldn't
-     * be a problem.
-     */
-    private synchronized long incrementJobId() {
-        long id = nextJobId.getAndIncrement();
-        sharedPrefs.edit().putLong(String.format(SHARED_PREFS_JOB_ID_KEY, getName()), nextJobId.get()).apply();
-        return id;
-    }
-
     @Override
     public final String getName() {
         return name;
     }
 
     @Override
-    public final JobStatus add(Job job) {
+    public final Job.State add(Job job) {
         return add(job, 0);
     }
 
     @Override
-    public final JobStatus add(Job job, long delayMillis) {
+    public final Job.State add(Job job, long delayMillis) {
         if(isShutdown) {
             throw new IllegalStateException("Queue is shutdown");
         }
@@ -154,71 +149,69 @@ public class BasicJobQueue implements JobQueue {
             throw new IllegalArgumentException("Can't pass a null Job");
         }
 
-        JobStatus status;
         if(job.areMultipleInstancesAllowed() || !inFlightUIDs.contains(job.getUID())) {
-            status = new JobStatus(incrementJobId(), job);
-            JobQueueItem jobQueueItem = new JobQueueItem(status, System.currentTimeMillis() + delayMillis);
+            JobQueueItem jobQueueItem = new JobQueueItem(job, System.currentTimeMillis() + delayMillis);
             add(jobQueueItem);
+            return jobQueueItem.getState();
         }
         else {
-            status = new JobStatus(JobStatus.IDENTICAL_JOB_REJECTED);
+            return Job.State.IDENTICAL_JOB_REJECTED;
         }
-        return status;
     }
 
-    private JobStatus add(JobQueueItem job) {
+    private Job.State add(JobQueueItem job) {
         if(!isQueueReady.get()) {
             synchronized(isQueueReady) {
                 if(!isQueueReady.get()) {
-                    job.getStatus().setState(JobStatus.State.QUEUE_NOT_READY);
+                    job.setState(Job.State.QUEUE_NOT_READY);
                     queueNotReadyList.addLast(job);
+                    return job.getState();
                 }
             }
+        }
+
+        String group = job.getGroup();
+        if(group != null) {
+            synchronized(groupIndexMapLock) {
+                Integer groupIndex = groupIndexMap.get(group);
+                LinkedList<JobQueueItem> groupQueue = groupMap.get(group);
+                if(groupQueue == null) {
+                    groupQueue = new LinkedList<>();
+                    groupMap.put(group, groupQueue);
+                }
+                if(groupIndex == null || groupQueue.isEmpty()) {
+                    groupIndex = 0;
+                }
+                groupIndexMap.put(group, groupIndex + 1);
+                job.setGroupIndex(groupIndex);
+                groupQueue.addLast(job);
+            }
+        }
+        JobRunnable runnable = new JobRunnable(job);
+        long delayMillis = job.getValidAtTime() - System.currentTimeMillis();
+        if(delayMillis <= 0) {
+            job.setState(Job.State.ADDED);
+            queue.add(runnable);
         }
         else {
-            String group = job.getGroup();
-            if(group != null) {
-                synchronized(groupIndexMapLock) {
-                    Integer groupIndex = groupIndexMap.get(group);
-                    LinkedList<JobQueueItem> groupQueue = groupMap.get(group);
-                    if(groupQueue == null) {
-                        groupQueue = new LinkedList<>();
-                        groupMap.put(group, groupQueue);
-                    }
-                    if(groupIndex == null || groupQueue.isEmpty()) {
-                        groupIndex = 0;
-                    }
-                    groupIndexMap.put(group, groupIndex + 1);
-                    job.setGroupIndex(groupIndex);
-                    groupQueue.addLast(job);
-                }
-            }
-            JobRunnable runnable = new JobRunnable(job);
-            long delayMillis = job.getValidAtTime() - System.currentTimeMillis();
-            if(delayMillis <= 0) {
-                job.getStatus().setState(JobStatus.State.ADDED);
-                queue.add(runnable);
-            }
-            else {
-                job.getStatus().setState(JobStatus.State.COLD_STORAGE);
-                frozenJobExecutor.schedule(new FrozenJobRunnable(runnable), delayMillis, TimeUnit.MILLISECONDS);
-            }
-            onJobAdded(job);
-            inFlightUIDs.add(job.getJob().getUID());
-            jobItemMap.put(job.getStatus().getJobId(), runnable);
+            job.setState(Job.State.COLD_STORAGE);
+            frozenJobExecutor.schedule(new FrozenJobRunnable(runnable), delayMillis, TimeUnit.MILLISECONDS);
         }
-        return job.getStatus();
+        onJobAdded(job);
+        inFlightUIDs.add(job.getJob().getUID());
+        jobItemMap.put(job.getJob(), runnable);
+        return job.getState();
     }
 
     private void internalAddToQueueOrColdStorage(JobRunnable jobRunnable) {
         JobQueueItem job = jobRunnable.getJob();
         if(job != null) {
             if(job.getValidAtTime() <= System.currentTimeMillis()) {
-                job.getStatus().setState(JobStatus.State.QUEUED);
+                job.setState(Job.State.QUEUED);
                 queue.add(jobRunnable);
             }
             else {
-                job.getStatus().setState(JobStatus.State.COLD_STORAGE);
+                job.setState(Job.State.COLD_STORAGE);
                 frozenJobExecutor.schedule(new FrozenJobRunnable(jobRunnable),
                         job.getValidAtTime() - System.currentTimeMillis(), TimeUnit.MILLISECONDS);
             }
@@ -226,36 +219,24 @@ public class BasicJobQueue implements JobQueue {
     }
 
     @Override
-    public final void cancel(long jobId) {
+    public final void cancel(Job job) {
         if(isShutdown) {
             throw new IllegalStateException("Queue is shutdown");
         }
-        JobRunnable runnable = jobItemMap.get(jobId);
+        JobRunnable runnable = jobItemMap.get(job);
         if(runnable != null) {
             JobQueueItem jobQueueItem = runnable.getJob();
             if(executor.remove(runnable)) {
-                if(jobQueueItem != null) {
-                    JobStatus status = jobQueueItem.getStatus();
-                    if(status != null) {
-                        Job job = status.getJob();
-                        if(job != null) {
-                            try {
-                                job.onCanceled();
-                            } catch(Throwable ignore) {}
-                            onJobRemoved(jobQueueItem);
-                        }
-                    }
+                if(job != null) {
+                    try {
+                        job.onCanceled();
+                    } catch (Throwable ignore) {}
+                    onJobRemoved(jobQueueItem);
                 }
             }
             else {
-                if(jobQueueItem != null) {
-                    JobStatus status = jobQueueItem.getStatus();
-                    if(status != null) {
-                        Job job = status.getJob();
-                        if(job != null) {
-                            canceledJobs.add(status.getJobId());
-                        }
-                    }
+                if(job != null) {
+                    canceledJobs.add(job);
                 }
             }
         }
@@ -267,13 +248,13 @@ public class BasicJobQueue implements JobQueue {
             throw new IllegalStateException("Queue is shutdown");
         }
         queue.clear();
-        ArrayList<Long> jobStatusKeys = new ArrayList<>(jobItemMap.keySet());
-        for (Long id : jobStatusKeys) {
-            JobRunnable runnable = jobItemMap.get(id);
+        ArrayList<Job> jobStatusKeys = new ArrayList<>(jobItemMap.keySet());
+        for (Job job : jobStatusKeys) {
+            JobRunnable runnable = jobItemMap.get(job);
             if(runnable != null) {
                 JobQueueItem jobQueueItem = runnable.getJob();
-                if(jobQueueItem != null && jobQueueItem.getStatus() != null) {
-                    jobQueueItem.getStatus().setState(JobStatus.State.CANCELED);
+                if(jobQueueItem != null) {
+                    jobQueueItem.setState(Job.State.CANCELED);
                 }
             }
         }
@@ -287,15 +268,15 @@ public class BasicJobQueue implements JobQueue {
     }
 
     @Override
-    public final JobStatus getStatus(long jobId) {
+    public final Job.State getStatus(Job job) {
         if(isShutdown) {
             throw new IllegalStateException("Queue is shutdown");
         }
-        JobRunnable runnable = jobItemMap.get(jobId);
+        JobRunnable runnable = jobItemMap.get(job);
         if(runnable != null) {
             JobQueueItem jobQueueItem = runnable.getJob();
             if(jobQueueItem != null) {
-                return jobQueueItem.getStatus();
+                return jobQueueItem.getState();
             }
             else {
                 return null;
@@ -319,6 +300,8 @@ public class BasicJobQueue implements JobQueue {
 
         isShutdown = true;
 
+        activeQueues.remove(getName());
+
         executor.shutdownNow();
         frozenJobExecutor.shutdownNow();
 
@@ -341,13 +324,13 @@ public class BasicJobQueue implements JobQueue {
     protected final void addPersistedJobs(List<JobQueueItem> jobs) {
         if(jobs != null) {
             for(JobQueueItem job : jobs) {
-                if(job != null && job.getStatus() != null && job.getJob() != null) {
+                if(job != null && job.getJob() != null) {
                     if(job.getJob().areMultipleInstancesAllowed() || !inFlightUIDs.contains(job.getJob().getUID())) {
                         JobRunnable runnable = new JobRunnable(job);
                         internalAddToQueueOrColdStorage(runnable);
                         onJobModified(job);
                         inFlightUIDs.add(job.getJob().getUID());
-                        jobItemMap.put(job.getJobId(), runnable);
+                        jobItemMap.put(job.getJob(), runnable);
                         if(job.isGroupMember()) {
                             LinkedList<JobQueueItem> groupQueue = groupMap.get(job.getGroup());
                             if(groupQueue == null) {
@@ -399,7 +382,16 @@ public class BasicJobQueue implements JobQueue {
         }
 
         if(externalEventListener != null) {
-            externalEventListener.onStarted();
+            if(jobs == null) {
+                externalEventListener.onStarted(Collections.unmodifiableList(new ArrayList<Job>(0)));
+            }
+            else {
+                List<Job> loadedPersistedJobs = new ArrayList<>(jobs.size());
+                for(JobQueueItem job : jobs) {
+                    loadedPersistedJobs.add(job.getJob());
+                }
+                externalEventListener.onStarted(Collections.unmodifiableList(loadedPersistedJobs));
+            }
         }
     }
 
@@ -426,7 +418,7 @@ public class BasicJobQueue implements JobQueue {
      * Called when a {@link Job} has been canceled via the public API,
      * completed successfully, or failed and couldn't be retried.
      * @param job the {@code Job} that was removed
-     * @see JobQueue#cancel(long)
+     * @see JobQueue#cancel(Job)
      */
     @SuppressWarnings("unused")
     protected void onPersistJobRemoved(JobQueueItem job) {/*Intentionally empty*/}
@@ -447,7 +439,7 @@ public class BasicJobQueue implements JobQueue {
 
     private void onJobAdded(JobQueueItem job) {
         if(externalEventListener != null) {
-            externalEventListener.onJobAdded(job.getStatus());
+            externalEventListener.onJobAdded(job.getJob());
         }
         if(job.getJob().isPersistent()) {
             onPersistJobAdded(job);
@@ -457,7 +449,7 @@ public class BasicJobQueue implements JobQueue {
     private void onJobRemoved(JobQueueItem job) {
         inFlightUIDs.remove(job.getJob().getUID());
         if(externalEventListener != null) {
-            externalEventListener.onJobRemoved(job.getStatus());
+            externalEventListener.onJobRemoved(job.getJob());
         }
         if(job.getJob().isPersistent()) {
             onPersistJobRemoved(job);
@@ -466,7 +458,7 @@ public class BasicJobQueue implements JobQueue {
 
     private void onJobModified(JobQueueItem job) {
         if(externalEventListener != null) {
-            externalEventListener.onJobModified(job.getStatus());
+            externalEventListener.onJobModified(job.getJob());
         }
         if(job.getJob().isPersistent()) {
             onPersistJobModified(job);
@@ -475,7 +467,8 @@ public class BasicJobQueue implements JobQueue {
 
     protected final class JobQueueItem {
         private long validAtTime;
-        private JobStatus status;
+        private Job job;
+        private Job.State state = Job.State.NOTHING;
         private int groupIndex = -1;
 
         private int networkRetryCount = 0;
@@ -483,25 +476,23 @@ public class BasicJobQueue implements JobQueue {
         private int groupRetryCount = 0;
         private BackoffPolicy groupBackoffPolicy = new BackoffPolicy.Linear(1000);
 
-        public JobQueueItem(JobStatus status) {
-            this(status, System.currentTimeMillis());
-        }
-
-        public JobQueueItem(JobStatus status, long validAtTime) {
-            this.status = status;
+        public JobQueueItem(Job job, long validAtTime) {
+            if(job == null) {
+                throw new IllegalArgumentException("Job cannot be null");
+            }
             this.validAtTime = validAtTime;
         }
 
         public Job getJob() {
-            return status.getJob();
+            return job;
         }
 
-        public JobStatus getStatus() {
-            return status;
+        public Job.State getState() {
+            return state;
         }
 
-        public long getJobId() {
-            return status.getJobId();
+        public void setState(Job.State state) {
+            this.state = state;
         }
 
         public long getValidAtTime() {
@@ -529,7 +520,7 @@ public class BasicJobQueue implements JobQueue {
         }
 
         public boolean isGroupMember() {
-            return groupIndex >= 0 && status.getJob().getGroup() != null;
+            return groupIndex >= 0 && job.getGroup() != null;
         }
 
         public int getGroupIndex() {
@@ -545,16 +536,7 @@ public class BasicJobQueue implements JobQueue {
         }
 
         public String getGroup() {
-            return status.getJob().getGroup();
-        }
-
-        public boolean equals(JobQueueItem other) {
-            if(other == null) {
-                return false;
-            }
-            else {
-                return getJob().getUID().equals(other.getJob().getUID());
-            }
+            return job.getGroup();
         }
     }
 
@@ -601,12 +583,12 @@ public class BasicJobQueue implements JobQueue {
         @Override
         public void run() {
             // if this specific job was canceled ignore it
-            if(canceledJobs.contains(job.getJobId())) {
-                job.getStatus().setState(JobStatus.State.CANCELED);
+            if(canceledJobs.contains(job.getJob())) {
+                job.setState(Job.State.CANCELED);
                 try {
                     job.getJob().onCanceled();
                 } catch(Throwable ignore) {}
-                canceledJobs.remove(job.getJobId());
+                canceledJobs.remove(job.getJob());
                 onJobRemoved(job);
                 return;
             }
@@ -630,7 +612,7 @@ public class BasicJobQueue implements JobQueue {
                 LinkedList<JobQueueItem> groupQueue = groupMap.get(job.getGroup());
                 // it should never be null
                 if(groupQueue != null) {
-                    if(!job.equals(groupQueue.peekFirst())) {
+                    if(job != groupQueue.peekFirst()) {
                         job.incrementGroupRetryCount();
                         job.setValidAtTime(System.currentTimeMillis() + job.getGroupRetryBackoffMillis());
                         internalAddToQueueOrColdStorage(this);
@@ -643,7 +625,7 @@ public class BasicJobQueue implements JobQueue {
             boolean retry = false;
             do {
                 try {
-                    job.getStatus().setState(JobStatus.State.ACTIVE);
+                    job.setState(Job.State.ACTIVE);
                     job.getJob().performJob();
                     if(job.getJob() instanceof Waitable) {
                         ((Waitable) job.getJob()).await();
@@ -652,7 +634,7 @@ public class BasicJobQueue implements JobQueue {
                     if(job.isGroupMember()) {
                         popGroupQueue();
                     }
-                    job.getStatus().setState(JobStatus.State.FINISHED);
+                    job.setState(Job.State.FINISHED);
                 }
                 catch(Throwable e) {
                     try {
