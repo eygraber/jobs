@@ -154,7 +154,7 @@ public abstract class BasicJob implements Job, Waitable {
         if(asyncCountdown.get() > 0) {
             synchronized(asyncCountdown) {
                 while(asyncCountdown.get() > 0) {
-                    wait();
+                    asyncCountdown.wait();
                     if(asyncThrowable != null) {
                         throw asyncThrowable;
                     }
@@ -173,7 +173,7 @@ public abstract class BasicJob implements Job, Waitable {
     public final void notifyAsyncTaskDone() {
         synchronized(asyncCountdown) {
             asyncCountdown.decrementAndGet();
-            notify();
+            asyncCountdown.notify();
         }
     }
 
