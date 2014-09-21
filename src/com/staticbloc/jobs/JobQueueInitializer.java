@@ -40,23 +40,23 @@ public class JobQueueInitializer {
         return this;
     }
 
-    public String getName() {
+    /*package*/ String getName() {
         return name;
     }
 
-    public int getMinLiveConsumers() {
+    /*package*/ int getMinLiveConsumers() {
         return minLiveConsumers;
     }
 
-    public int getMaxLiveConsumers() {
+    /*package*/ int getMaxLiveConsumers() {
         return maxLiveConsumers;
     }
 
-    public int getConsumerKeepAliveSeconds() {
+    /*package*/ int getConsumerKeepAliveSeconds() {
         return consumerKeepAliveSeconds;
     }
 
-    public JobQueueEventListener getJobQueueEventListener() {
+    /*package*/ JobQueueEventListener getJobQueueEventListener() {
         return jobQueueEventListener;
     }
 }

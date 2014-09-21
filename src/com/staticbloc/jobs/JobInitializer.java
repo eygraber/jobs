@@ -47,27 +47,27 @@ public class JobInitializer {
         return this;
     }
 
-    public int getPriority() {
+    /*package*/ int getPriority() {
         return priority;
     }
 
-    public boolean requiresNetwork() {
+    /*package*/ boolean requiresNetwork() {
         return requiresNetwork;
     }
 
-    public boolean isPersistent() {
+    /*package*/ boolean isPersistent() {
         return isPersistent;
     }
 
-    public String getGroup() {
+    /*package*/ String getGroup() {
         return group;
     }
 
-    public int getRetryLimit() {
+    /*package*/ int getRetryLimit() {
         return retryLimit;
     }
 
-    public BackoffPolicy getBackoffPolicy() {
+    /*package*/ BackoffPolicy getBackoffPolicy() {
         return backoffPolicy;
     }
 }
