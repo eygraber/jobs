@@ -134,6 +134,9 @@ public abstract class BasicJob implements Job, Waitable {
     public void onRetry() {}
 
     @Override
+    public void onCanceled() {}
+
+    @Override
     public int getInitialLockCount() {
         return 0;
     }
