@@ -4,7 +4,7 @@ import java.util.HashSet;
 import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 
-public abstract class BasicJob implements Job, Waitable {
+public class BasicJob implements Job, Waitable {
     public final static boolean DEFAULT_CAN_REACH_REQUIRED_NETWORK = true;
 
     private int priority;
@@ -112,6 +112,11 @@ public abstract class BasicJob implements Job, Waitable {
     }
 
     @Override
+    public boolean areMultipleInstancesAllowed() {
+        return false;
+    }
+
+    @Override
     public final int getRetryCount() {
         return retryCount;
     }
@@ -135,6 +140,9 @@ public abstract class BasicJob implements Job, Waitable {
 
     @Override
     public void onCanceled() {}
+
+    @Override
+    public void onRetryLimitReached() {}
 
     @Override
     public int getInitialLockCount() {
