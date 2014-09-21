@@ -6,6 +6,7 @@ import android.content.Intent;
 import android.content.IntentFilter;
 import android.net.ConnectivityManager;
 import android.net.NetworkInfo;
+import android.util.Log;
 
 import java.util.*;
 import java.util.concurrent.*;
@@ -16,7 +17,6 @@ public class BasicJobQueue implements JobQueue {
 
     private final String name;
 
-    private final PriorityBlockingQueue<JobRunnable> queue;
     private final JobExecutor executor;
     private final ScheduledExecutorService frozenJobExecutor;
 
@@ -43,6 +43,7 @@ public class BasicJobQueue implements JobQueue {
     private final boolean shouldDebugLog;
 
     private static class JobExecutor {
+        private final PriorityBlockingQueue<JobRunnable> queue;
         private AtomicBoolean isShutdown = new AtomicBoolean(false);
         private ThreadPoolExecutor executor;
 
@@ -50,16 +51,31 @@ public class BasicJobQueue implements JobQueue {
         // PriorityBlockingQueue<JobRunnable> to BlockingQueue<Runnable>
         // http://stackoverflow.com/questions/25865910/java-blockingqueuerunnable-inconvertible-types
         @SuppressWarnings("unchecked")
-        public JobExecutor(final String queueName, int corePoolSize, int maximumPoolSize, long keepAliveTime,
-                           PriorityBlockingQueue<JobRunnable> workQueue) {
-            executor = new ThreadPoolExecutor(corePoolSize, maximumPoolSize, keepAliveTime, TimeUnit.MILLISECONDS,
-                    (BlockingQueue) workQueue, new ThreadFactory() {
+        public JobExecutor(final String queueName, int corePoolSize, int maximumPoolSize, long keepAliveTime) {
+            queue = new PriorityBlockingQueue<>(15, new JobComparator());
+            executor = new ThreadPoolExecutor(maximumPoolSize, maximumPoolSize, keepAliveTime, TimeUnit.MILLISECONDS,
+                    (BlockingQueue) queue, new ThreadFactory() {
                 @Override
                 public Thread newThread(Runnable r) {
                     return new Thread(r, queueName);
                 }
             });
             executor.allowCoreThreadTimeOut(false);
+            for(int i = 0; i < corePoolSize; i++) {
+                executor.prestartCoreThread();
+            }
+        }
+
+        public void execute(JobRunnable runnable) {
+            if(!isShutdown.get()) {
+                executor.execute(runnable);
+            }
+        }
+
+        public void clear() {
+            if(!isShutdown.get()) {
+                queue.clear();
+            }
         }
 
         public boolean remove(JobRunnable runnable) {
@@ -111,9 +127,8 @@ public class BasicJobQueue implements JobQueue {
 
         this.shouldDebugLog = initializer.getShouldDebugLog();
 
-        queue = new PriorityBlockingQueue<>(15, new JobComparator());
         executor = new JobExecutor(name, initializer.getMinLiveConsumers(), initializer.getMaxLiveConsumers(),
-                initializer.getConsumerKeepAliveSeconds(), queue);
+                initializer.getConsumerKeepAliveSeconds());
         frozenJobExecutor = Executors.newSingleThreadScheduledExecutor();
 
         externalEventListener = initializer.getJobQueueEventListener();
@@ -146,6 +161,9 @@ public class BasicJobQueue implements JobQueue {
         }
         isStarted = true;
         onLoadPersistedData();
+        if(shouldDebugLog) {
+            Log.d(getName(), String.format("%s started", getName()));
+        }
     }
 
     @Override
@@ -171,6 +189,10 @@ public class BasicJobQueue implements JobQueue {
             return jobQueueItem.getState();
         }
         else {
+            if(shouldDebugLog) {
+                Log.d(getName(), String.format("%s rejected because there is already an instance of it in the queue",
+                        job.getClass().getSimpleName()));
+            }
             return Job.State.IDENTICAL_JOB_REJECTED;
         }
     }
@@ -181,6 +203,10 @@ public class BasicJobQueue implements JobQueue {
                 if(!isQueueReady.get()) {
                     job.setState(Job.State.QUEUE_NOT_READY);
                     queueNotReadyList.addLast(job);
+                    if(shouldDebugLog) {
+                        Log.d(getName(), String.format("%s added delayed because queue is not yet ready",
+                                job.getJob().getClass().getSimpleName()));
+                    }
                     return job.getState();
                 }
             }
@@ -201,17 +227,29 @@ public class BasicJobQueue implements JobQueue {
                 groupIndexMap.put(group, groupIndex + 1);
                 job.setGroupIndex(groupIndex);
                 groupQueue.addLast(job);
+                if(shouldDebugLog) {
+                    Log.d(getName(), String.format("%s added to group %s with index %d",
+                            job.getJob().getClass().getSimpleName(), group, groupIndex));
+                }
             }
         }
         JobRunnable runnable = new JobRunnable(job);
         long delayMillis = job.getValidAtTime() - System.currentTimeMillis();
         if(delayMillis <= 0) {
             job.setState(Job.State.ADDED);
-            queue.add(runnable);
+            executor.execute(runnable);
+            if(shouldDebugLog) {
+                Log.d(getName(), String.format("%s added to queue",
+                        job.getJob().getClass().getSimpleName()));
+            }
         }
         else {
             job.setState(Job.State.COLD_STORAGE);
             frozenJobExecutor.schedule(new FrozenJobRunnable(runnable), delayMillis, TimeUnit.MILLISECONDS);
+            if(shouldDebugLog) {
+                Log.d(getName(), String.format("%s added to queue delayed by %d",
+                        job.getJob().getClass().getSimpleName(), delayMillis));
+            }
         }
         onJobAdded(job);
         inFlightUIDs.add(job.getJob().getUID());
@@ -224,7 +262,7 @@ public class BasicJobQueue implements JobQueue {
         if(job != null) {
             if(job.getValidAtTime() <= System.currentTimeMillis()) {
                 job.setState(Job.State.QUEUED);
-                queue.add(jobRunnable);
+                executor.execute(jobRunnable);
             }
             else {
                 job.setState(Job.State.COLD_STORAGE);
@@ -251,6 +289,10 @@ public class BasicJobQueue implements JobQueue {
                         job.onCanceled();
                     } catch (Throwable ignore) {}
                     onJobRemoved(jobQueueItem);
+                    if(shouldDebugLog) {
+                        Log.d(getName(), String.format("%s canceled",
+                                job.getClass().getSimpleName()));
+                    }
                 }
             }
             else {
@@ -269,7 +311,7 @@ public class BasicJobQueue implements JobQueue {
         if(!isStarted) {
             throw new IllegalStateException("This JobQueue has not been started yet. Did you call start()?");
         }
-        queue.clear();
+        executor.clear();
         ArrayList<Job> jobStatusKeys = new ArrayList<>(jobItemMap.keySet());
         for (Job job : jobStatusKeys) {
             JobRunnable runnable = jobItemMap.get(job);
@@ -286,6 +328,9 @@ public class BasicJobQueue implements JobQueue {
         onPersistAllJobsCanceled();
         if(externalEventListener != null) {
             externalEventListener.onAllJobsCanceled();
+        }
+        if(shouldDebugLog) {
+            Log.d(getName(), String.format("All jobs canceled for %s", getName()));
         }
     }
 
@@ -346,6 +391,10 @@ public class BasicJobQueue implements JobQueue {
         if(externalEventListener != null) {
             externalEventListener.onShutdown(keepPersisted);
         }
+
+        if(shouldDebugLog) {
+            Log.d(getName(), String.format("%s shutdown", getName()));
+        }
     }
 
     protected boolean shouldDebugLog() {
@@ -374,6 +423,10 @@ public class BasicJobQueue implements JobQueue {
                             }
                             groupQueue.addLast(job);
                             groupMap.put(job.getGroup(), groupQueue);
+                        }
+                        if(shouldDebugLog) {
+                            Log.d(getName(), String.format("%s loaded from persistence",
+                                    job.getJob().getClass().getSimpleName()));
                         }
                     }
                 }
@@ -627,17 +680,29 @@ public class BasicJobQueue implements JobQueue {
                 } catch(Throwable ignore) {}
                 canceledJobs.remove(job.getJob());
                 onJobRemoved(job);
+                if(shouldDebugLog) {
+                    Log.d(getName(), String.format("%s canceled",
+                            job.getJob().getClass().getSimpleName()));
+                }
                 return;
             }
 
             // ensure that the job can reach its required networks if it has any
             if(job.getJob().requiresNetwork()) {
+                if(shouldDebugLog) {
+                    Log.d(getName(), String.format("%s requires network...checking access",
+                            job.getJob().getClass().getSimpleName()));
+                }
                 try {
                     if(!isConnectedToNetwork.get() || !job.getJob().canReachRequiredNetwork()) {
                         job.incrementNetworkRetryCount();
                         job.setValidAtTime(System.currentTimeMillis() + job.getNetworkRetryBackoffMillis());
                         internalAddToQueueOrColdStorage(this);
                         onJobModified(job);
+                        if(shouldDebugLog) {
+                            Log.d(getName(), String.format("%s cannot access its required network...adding back to queue in %d",
+                                    job.getJob().getClass().getSimpleName(), job.getNetworkRetryBackoffMillis()));
+                        }
                         return;
                     }
                 } catch(Throwable ignore) {}
@@ -646,10 +711,18 @@ public class BasicJobQueue implements JobQueue {
             // if this job is part of a group, ensure that it is the next job
             // from that group that should be run
             if(job.isGroupMember()) {
+                if(shouldDebugLog) {
+                    Log.d(getName(), String.format("%s is in group %s",
+                            job.getJob().getClass().getSimpleName(), job.getGroup()));
+                }
                 LinkedList<JobQueueItem> groupQueue = groupMap.get(job.getGroup());
                 // it should never be null
                 if(groupQueue != null) {
                     if(job != groupQueue.peekFirst()) {
+                        if(shouldDebugLog) {
+                            Log.d(getName(), String.format("%s is not the head of its group...adding back to queue in %d",
+                                    job.getJob().getClass().getSimpleName(), job.getGroupRetryBackoffMillis()));
+                        }
                         job.incrementGroupRetryCount();
                         job.setValidAtTime(System.currentTimeMillis() + job.getGroupRetryBackoffMillis());
                         internalAddToQueueOrColdStorage(this);
@@ -663,17 +736,39 @@ public class BasicJobQueue implements JobQueue {
             do {
                 try {
                     job.setState(Job.State.ACTIVE);
+                    if(shouldDebugLog) {
+                        Log.d(getName(), String.format("%s about to run",
+                                job.getJob().getClass().getSimpleName()));
+                    }
                     job.getJob().performJob();
                     if(job.getJob() instanceof Waitable) {
+                        if(((Waitable) job.getJob()).getInitialLockCount() > 0) {
+                            if(shouldDebugLog) {
+                                Log.d(getName(), String.format("%s may wait for async tasks",
+                                        job.getJob().getClass().getSimpleName()));
+                            }
+                        }
                         ((Waitable) job.getJob()).waitForAsyncTasks();
                     }
                     onJobRemoved(job);
                     if(job.isGroupMember()) {
+                        if(shouldDebugLog) {
+                            Log.d(getName(), String.format("%s popped as group %s head",
+                                    job.getJob().getClass().getSimpleName(), job.getGroup()));
+                        }
                         popGroupQueue();
                     }
                     job.setState(Job.State.FINISHED);
+                    if(shouldDebugLog) {
+                        Log.d(getName(), String.format("%s completed",
+                                job.getJob().getClass().getSimpleName()));
+                    }
                 }
                 catch(Throwable e) {
+                    if(shouldDebugLog) {
+                        Log.d(getName(), String.format("%s threw an error",
+                                job.getJob().getClass().getSimpleName()));
+                    }
                     try {
                         retry = job.getJob().onError(e);
                     } catch(Throwable ignore) {
@@ -690,6 +785,14 @@ public class BasicJobQueue implements JobQueue {
                             onJobRemoved(job);
                             if(job.isGroupMember()) {
                                 popGroupQueue();
+                                if(shouldDebugLog) {
+                                    Log.d(getName(), String.format("%s popped as group %s head",
+                                            job.getJob().getClass().getSimpleName(), job.getGroup()));
+                                }
+                            }
+                            if(shouldDebugLog) {
+                                Log.d(getName(), String.format("%s reached its retry limit...removing from queue",
+                                        job.getJob().getClass().getSimpleName()));
                             }
                         }
                         else {
@@ -703,6 +806,10 @@ public class BasicJobQueue implements JobQueue {
                             // otherwise update the timestamp and stick it back in the queue
                             if(backoffMillis > 0 && backoffMillis <= 1000) {
                                 try {
+                                    if(shouldDebugLog) {
+                                        Log.d(getName(), String.format("%s retrying in %d",
+                                                job.getJob().getClass().getSimpleName(), backoffMillis));
+                                    }
                                     Thread.sleep(backoffMillis);
                                 } catch (InterruptedException ignore) {}
                             }
@@ -710,6 +817,10 @@ public class BasicJobQueue implements JobQueue {
                                 retry = false;
                                 job.setValidAtTime(System.currentTimeMillis() + backoffMillis);
                                 internalAddToQueueOrColdStorage(this);
+                                if(shouldDebugLog) {
+                                    Log.d(getName(), String.format("Adding %s back to queue in %d",
+                                            job.getJob().getClass().getSimpleName(), backoffMillis));
+                                }
                             }
                             onJobModified(job);
                         }
@@ -718,6 +829,14 @@ public class BasicJobQueue implements JobQueue {
                         onJobRemoved(job);
                         if(job.isGroupMember()) {
                             popGroupQueue();
+                            if(shouldDebugLog) {
+                                Log.d(getName(), String.format("%s popped as group %s head",
+                                        job.getJob().getClass().getSimpleName(), job.getGroup()));
+                            }
+                        }
+                        if(shouldDebugLog) {
+                            Log.d(getName(), String.format("%s not retrying...removing from queue",
+                                    job.getJob().getClass().getSimpleName()));
                         }
                     }
                 }

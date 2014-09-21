@@ -24,6 +24,9 @@ public final class SqlJobQueue extends BasicPersistentJobQueue {
 
     @Override
     protected void onLoadPersistedData() {
+        if(shouldDebugLog()) {
+            Log.d(getName(), String.format("%s about to load persisted data", getName()));
+        }
         getPersistenceExecutor().execute(new Runnable() {
             @Override
             public void run() {
@@ -34,6 +37,9 @@ public final class SqlJobQueue extends BasicPersistentJobQueue {
 
     @Override
     protected void onPersistJobAdded(final JobQueueItem job) {
+        if(shouldDebugLog()) {
+            Log.d(getName(), String.format("%s persisting added %s", getName(), job.getJob().getClass().getSimpleName()));
+        }
         getPersistenceExecutor().execute(new Runnable() {
             @Override
             public void run() {
@@ -44,16 +50,22 @@ public final class SqlJobQueue extends BasicPersistentJobQueue {
 
     @Override
     protected void onPersistJobRemoved(final JobQueueItem job) {
+        if(shouldDebugLog()) {
+            Log.d(getName(), String.format("%s persisting removed %s", getName(), job.getJob().getClass().getSimpleName()));
+        }
         getPersistenceExecutor().execute(new Runnable() {
             @Override
             public void run() {
-                db.removeJob(getName(), job);
+                db.removeJob(getName(), job, shouldDebugLog());
             }
         });
     }
 
     @Override
     protected void onPersistAllJobsCanceled() {
+        if(shouldDebugLog()) {
+            Log.d(getName(), String.format("%s persisting removing all Jobs", getName()));
+        }
         getPersistenceExecutor().execute(new Runnable() {
             @Override
             public void run() {
@@ -64,10 +76,13 @@ public final class SqlJobQueue extends BasicPersistentJobQueue {
 
     @Override
     protected void onPersistJobModified(final JobQueueItem job) {
+        if(shouldDebugLog()) {
+            Log.d(getName(), String.format("%s persisting modified %s", getName(), job.getJob().getClass().getSimpleName()));
+        }
         getPersistenceExecutor().execute(new Runnable() {
             @Override
             public void run() {
-                db.updateJob(getName(), job);
+                db.updateJob(getName(), job, shouldDebugLog());
             }
         });
     }
@@ -155,10 +170,13 @@ public final class SqlJobQueue extends BasicPersistentJobQueue {
             jobToSqlIdMap.put(job, id);
         }
 
-        public void updateJob(String queueName, JobQueueItem job) {
+        public void updateJob(String queueName, JobQueueItem job, boolean shouldLog) {
             Long id = jobToSqlIdMap.get(job);
             if(id == null) {
-                Log.w(queueName, "Tried to update job, but SQL id doesn't exist");
+                if(shouldLog) {
+                    Log.w(queueName, String.format("Tried to update %s, but SQL id doesn't exist",
+                                                    job.getJob().getClass().getSimpleName()));
+                }
                 return;
             }
             ContentValues values = new ContentValues();
@@ -169,10 +187,13 @@ public final class SqlJobQueue extends BasicPersistentJobQueue {
                     null);
         }
 
-        public void removeJob(String queueName, JobQueueItem job) {
+        public void removeJob(String queueName, JobQueueItem job, boolean shouldLog) {
             Long id = jobToSqlIdMap.get(job);
             if(id == null) {
-                Log.w(queueName, "Tried to remove job, but SQL id doesn't exist");
+                if(shouldLog) {
+                    Log.w(queueName, String.format("Tried to remove %s, but SQL id doesn't exist",
+                            job.getJob().getClass().getSimpleName()));
+                }
                 return;
             }
             getWritableDatabase().delete(JOB_TABLE_NAME,
