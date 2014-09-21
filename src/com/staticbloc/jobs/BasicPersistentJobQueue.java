@@ -6,13 +6,16 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
 public abstract class BasicPersistentJobQueue extends BasicJobQueue {
-    private ExecutorService executor = Executors.newSingleThreadExecutor();
+    private ExecutorService executor;
 
     BasicPersistentJobQueue(Context context, JobQueueInitializer initializer) {
         super(context, initializer);
     }
 
     protected ExecutorService getPersistenceExecutor() {
+        if(executor == null) {
+            executor = Executors.newSingleThreadExecutor();
+        }
         return executor;
     }
 
