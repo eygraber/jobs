@@ -7,6 +7,11 @@ public interface JobQueue {
     public String getName();
 
     /**
+     * Starts this queue.
+     */
+    public void start();
+
+    /**
      * Add a new {@link Job} to the queue.
      * @param job the {@code Job} to add
      * @return a {@link Job.State} indicating whether the {@code Job}

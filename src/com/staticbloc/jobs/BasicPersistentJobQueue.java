@@ -10,12 +10,10 @@ public abstract class BasicPersistentJobQueue extends BasicJobQueue {
 
     BasicPersistentJobQueue(Context context, JobQueueInitializer initializer) {
         super(context, initializer);
+        executor = Executors.newSingleThreadExecutor();
     }
 
     protected ExecutorService getPersistenceExecutor() {
-        if(executor == null) {
-            executor = Executors.newSingleThreadExecutor();
-        }
         return executor;
     }
 

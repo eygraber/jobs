@@ -32,6 +32,7 @@ public class BasicJobQueue implements JobQueue {
     private final AtomicBoolean isQueueReady;
     private final AtomicBoolean isConnectedToNetwork;
 
+    private boolean isStarted;
     private boolean isShutdown;
 
     private final JobQueueEventListener externalEventListener;
@@ -127,16 +128,24 @@ public class BasicJobQueue implements JobQueue {
         isQueueReady = new AtomicBoolean(false);
         isConnectedToNetwork = new AtomicBoolean(false);
 
+        isStarted = false;
         isShutdown = false;
 
         initNetworkConnectionChecker();
-
-        onLoadPersistedData();
     }
 
     @Override
     public final String getName() {
         return name;
+    }
+
+    @Override
+    public final void start() {
+        if(isStarted) {
+            throw new IllegalStateException("This JobQueue was already started");
+        }
+        isStarted = true;
+        onLoadPersistedData();
     }
 
     @Override
@@ -147,7 +156,10 @@ public class BasicJobQueue implements JobQueue {
     @Override
     public final Job.State add(Job job, long delayMillis) {
         if(isShutdown) {
-            throw new IllegalStateException("Queue is shutdown");
+            throw new IllegalStateException("This JobQueue has been shutdown");
+        }
+        if(!isStarted) {
+            throw new IllegalStateException("This JobQueue has not been started yet. Did you call start()?");
         }
         if(job == null) {
             throw new IllegalArgumentException("Can't pass a null Job");
@@ -225,7 +237,10 @@ public class BasicJobQueue implements JobQueue {
     @Override
     public final void cancel(Job job) {
         if(isShutdown) {
-            throw new IllegalStateException("Queue is shutdown");
+            throw new IllegalStateException("This JobQueue has been shutdown");
+        }
+        if(!isStarted) {
+            throw new IllegalStateException("This JobQueue has not been started yet. Did you call start()?");
         }
         JobRunnable runnable = jobItemMap.get(job);
         if(runnable != null) {
@@ -249,7 +264,10 @@ public class BasicJobQueue implements JobQueue {
     @Override
     public final void cancelAll() {
         if(isShutdown) {
-            throw new IllegalStateException("Queue is shutdown");
+            throw new IllegalStateException("This JobQueue has been shutdown");
+        }
+        if(!isStarted) {
+            throw new IllegalStateException("This JobQueue has not been started yet. Did you call start()?");
         }
         queue.clear();
         ArrayList<Job> jobStatusKeys = new ArrayList<>(jobItemMap.keySet());
@@ -274,7 +292,10 @@ public class BasicJobQueue implements JobQueue {
     @Override
     public final Job.State getStatus(Job job) {
         if(isShutdown) {
-            throw new IllegalStateException("Queue is shutdown");
+            throw new IllegalStateException("This JobQueue has been shutdown");
+        }
+        if(!isStarted) {
+            throw new IllegalStateException("This JobQueue has not been started yet. Did you call start()?");
         }
         JobRunnable runnable = jobItemMap.get(job);
         if(runnable != null) {
@@ -299,7 +320,10 @@ public class BasicJobQueue implements JobQueue {
     @Override
     public final void shutdown(boolean keepPersisted) {
         if(isShutdown) {
-            throw new IllegalStateException("Queue is shutdown");
+            throw new IllegalStateException("This JobQueue has been shutdown");
+        }
+        if(!isStarted) {
+            throw new IllegalStateException("This JobQueue has not been started yet. Did you call start()?");
         }
 
         isShutdown = true;
@@ -492,6 +516,7 @@ public class BasicJobQueue implements JobQueue {
             if(job == null) {
                 throw new IllegalArgumentException("Job cannot be null");
             }
+            this.job = job;
             this.validAtTime = validAtTime;
         }
 

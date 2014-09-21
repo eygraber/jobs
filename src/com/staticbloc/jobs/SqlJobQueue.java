@@ -99,7 +99,7 @@ public final class SqlJobQueue extends BasicPersistentJobQueue {
                 KEY_QUEUE_NAME + " TEXT NOT NULL, " +
                 KEY_JOB_JSON + " TEXT NOT NULL);";
         private static final String JOB_WHERE_CLAUSE = KEY_ROW_ID + "=%d";
-        private static final String ALL_JOBS_IN_QUEUE_WHERE_CLAUSE = KEY_QUEUE_NAME + "='%s'";
+        private static final String ALL_JOBS_IN_QUEUE_WHERE_CLAUSE = KEY_QUEUE_NAME + "=%s";
 
         private Gson gson;
 
