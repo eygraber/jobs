@@ -640,7 +640,7 @@ public class BasicJobQueue implements JobQueue {
                     job.setState(Job.State.ACTIVE);
                     job.getJob().performJob();
                     if(job.getJob() instanceof Waitable) {
-                        ((Waitable) job.getJob()).await();
+                        ((Waitable) job.getJob()).waitForAsyncTasks();
                     }
                     onJobRemoved(job);
                     if(job.isGroupMember()) {

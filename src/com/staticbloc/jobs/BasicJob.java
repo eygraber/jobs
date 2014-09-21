@@ -3,6 +3,7 @@ package com.staticbloc.jobs;
 import java.util.HashSet;
 import java.util.Set;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.atomic.AtomicInteger;
 
 public abstract class BasicJob implements Job, Waitable {
     public final static boolean DEFAULT_CAN_REACH_REQUIRED_NETWORK = true;
@@ -14,9 +15,12 @@ public abstract class BasicJob implements Job, Waitable {
     private int retryLimit;
     private BackoffPolicy backoffPolicy;
 
+    private Throwable asyncThrowable = null;
+
     private int retryCount;
 
     private CountDownLatch awaiter;
+    private final AtomicInteger asyncCountdown;
 
     private Set<Object> subsections;
 
@@ -44,8 +48,9 @@ public abstract class BasicJob implements Job, Waitable {
         if(getInitialLockCount() > 0) {
             awaiter = new CountDownLatch(getInitialLockCount());
         }
+        asyncCountdown = new AtomicInteger(getInitialLockCount());
 
-        subsections = new HashSet<Object>();
+        subsections = new HashSet<>();
     }
 
     /**
@@ -150,16 +155,36 @@ public abstract class BasicJob implements Job, Waitable {
     }
 
     @Override
-    public final void await() throws InterruptedException {
+    public final void waitForAsyncTasks() throws Throwable {
         if(awaiter != null) {
             awaiter.await();
+            if(asyncThrowable != null) {
+                throw asyncThrowable;
+            }
+        }
+        if(asyncCountdown.get() > 0) {
+            synchronized(asyncCountdown) {
+                while(asyncCountdown.get() > 0) {
+                    wait();
+                    if(asyncThrowable != null) {
+                        throw asyncThrowable;
+                    }
+                }
+            }
         }
     }
 
     @Override
-    public final void unlock() {
-        if(awaiter != null) {
-            awaiter.countDown();
+    public final void raiseThrowableFromAsyncTask(Throwable t) {
+        asyncThrowable = t;
+        notifyAsyncTaskDone();
+    }
+
+    @Override
+    public final void notifyAsyncTaskDone() {
+        synchronized(asyncCountdown) {
+            asyncCountdown.decrementAndGet();
+            notify();
         }
     }
 
