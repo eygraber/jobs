@@ -2,7 +2,6 @@ package com.staticbloc.jobs;
 
 import java.util.HashSet;
 import java.util.Set;
-import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.atomic.AtomicInteger;
 
 public abstract class BasicJob implements Job, Waitable {
@@ -19,7 +18,6 @@ public abstract class BasicJob implements Job, Waitable {
 
     private int retryCount;
 
-    private CountDownLatch awaiter;
     private final AtomicInteger asyncCountdown;
 
     private Set<Object> subsections;
@@ -45,9 +43,6 @@ public abstract class BasicJob implements Job, Waitable {
 
         retryCount = 0;
 
-        if(getInitialLockCount() > 0) {
-            awaiter = new CountDownLatch(getInitialLockCount());
-        }
         asyncCountdown = new AtomicInteger(getInitialLockCount());
 
         subsections = new HashSet<>();
@@ -156,12 +151,6 @@ public abstract class BasicJob implements Job, Waitable {
 
     @Override
     public final void waitForAsyncTasks() throws Throwable {
-        if(awaiter != null) {
-            awaiter.await();
-            if(asyncThrowable != null) {
-                throw asyncThrowable;
-            }
-        }
         if(asyncCountdown.get() > 0) {
             synchronized(asyncCountdown) {
                 while(asyncCountdown.get() > 0) {
