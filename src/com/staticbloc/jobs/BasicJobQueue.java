@@ -300,10 +300,14 @@ public class BasicJobQueue implements JobQueue {
 
         isShutdown = true;
 
-        activeQueues.remove(getName());
-
         executor.shutdownNow();
         frozenJobExecutor.shutdownNow();
+
+        if(!keepPersisted) {
+            onPersistAllJobsCanceled();
+        }
+
+        activeQueues.remove(getName());
 
         if(networkStatusReceiver != null) {
             try {
