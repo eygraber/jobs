@@ -5,11 +5,13 @@ public class JobQueueInitializer {
     public final static int DEFAULT_MIN_LIVE_CONSUMERS = 1;
     public final static int DEFAULT_MAX_LIVE_CONSUMERS = INFINITE;
     public final static int DEFAULT_CONSUMER_KEEP_ALIVE = INFINITE;
+    public final static boolean SHOULD_DEBUG_LOG_DEFAULT = false;
 
     private String name;
     private int minLiveConsumers = DEFAULT_MIN_LIVE_CONSUMERS;
     private int maxLiveConsumers = DEFAULT_MAX_LIVE_CONSUMERS;
     private int consumerKeepAliveSeconds = DEFAULT_CONSUMER_KEEP_ALIVE;
+    private boolean shouldDebugLog = SHOULD_DEBUG_LOG_DEFAULT;
 
     private JobQueueEventListener jobQueueEventListener;
 
@@ -40,6 +42,11 @@ public class JobQueueInitializer {
         return this;
     }
 
+    public JobQueueInitializer shouldDebugLog(boolean shouldDebugLog) {
+        this.shouldDebugLog = shouldDebugLog;
+        return this;
+    }
+
     /*package*/ String getName() {
         return name;
     }
@@ -58,5 +65,9 @@ public class JobQueueInitializer {
 
     /*package*/ JobQueueEventListener getJobQueueEventListener() {
         return jobQueueEventListener;
+    }
+
+    /*package*/ boolean getShouldDebugLog() {
+        return shouldDebugLog;
     }
 }

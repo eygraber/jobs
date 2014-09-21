@@ -47,7 +47,7 @@ public final class SqlJobQueue extends BasicPersistentJobQueue {
         getPersistenceExecutor().execute(new Runnable() {
             @Override
             public void run() {
-                db.removeJob(job);
+                db.removeJob(getName(), job);
             }
         });
     }
@@ -67,7 +67,7 @@ public final class SqlJobQueue extends BasicPersistentJobQueue {
         getPersistenceExecutor().execute(new Runnable() {
             @Override
             public void run() {
-                db.updateJob(job);
+                db.updateJob(getName(), job);
             }
         });
     }
@@ -155,10 +155,10 @@ public final class SqlJobQueue extends BasicPersistentJobQueue {
             jobToSqlIdMap.put(job, id);
         }
 
-        public void updateJob(JobQueueItem job) {
+        public void updateJob(String queueName, JobQueueItem job) {
             Long id = jobToSqlIdMap.get(job);
             if(id == null) {
-                // TODO: log warning
+                Log.w(queueName, "Tried to update job, but SQL id doesn't exist");
                 return;
             }
             ContentValues values = new ContentValues();
@@ -169,10 +169,10 @@ public final class SqlJobQueue extends BasicPersistentJobQueue {
                     null);
         }
 
-        public void removeJob(JobQueueItem job) {
+        public void removeJob(String queueName, JobQueueItem job) {
             Long id = jobToSqlIdMap.get(job);
             if(id == null) {
-                // TODO: log warning
+                Log.w(queueName, "Tried to remove job, but SQL id doesn't exist");
                 return;
             }
             getWritableDatabase().delete(JOB_TABLE_NAME,

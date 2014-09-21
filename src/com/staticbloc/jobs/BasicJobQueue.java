@@ -39,6 +39,8 @@ public class BasicJobQueue implements JobQueue {
     private final Context context;
     private BroadcastReceiver networkStatusReceiver;
 
+    private final boolean shouldDebugLog;
+
     private static class JobExecutor {
         private AtomicBoolean isShutdown = new AtomicBoolean(false);
         private ThreadPoolExecutor executor;
@@ -105,6 +107,8 @@ public class BasicJobQueue implements JobQueue {
             throw new IllegalArgumentException(("Context must not be null"));
         }
         this.context = context.getApplicationContext();
+
+        this.shouldDebugLog = initializer.getShouldDebugLog();
 
         queue = new PriorityBlockingQueue<>(15, new JobComparator());
         executor = new JobExecutor(name, initializer.getMinLiveConsumers(), initializer.getMaxLiveConsumers(),
@@ -318,6 +322,10 @@ public class BasicJobQueue implements JobQueue {
         if(externalEventListener != null) {
             externalEventListener.onShutdown(keepPersisted);
         }
+    }
+
+    protected boolean shouldDebugLog() {
+        return shouldDebugLog;
     }
 
     /**
