@@ -1,3 +1,7 @@
+task wrapper(type: Wrapper) {
+    gradleVersion = '2.1'
+}
+
 buildscript {
     repositories {
         jcenter()
@@ -46,14 +50,14 @@ dependencies {
 }
 
 task clearJar(type: Delete) {
-    delete 'build/outputs/jobs.jar'
+    delete "${buildDir}/outputs/${POM_ARTIFACT_ID}.jar"
 }
 
 task makeJar(type: Copy) {
-    from('build/intermediates/bundles/release/')
-    into('build/outputs/')
+    from("${buildDir}/intermediates/bundles/release/")
+    into("${buildDir}/outputs/")
     include('classes.jar')
-    rename ('classes.jar', 'jobs.jar')
+    rename ('classes.jar', "${POM_ARTIFACT_ID}.jar")
 }
 
 // only applies if gradle was run with uploadArchives
