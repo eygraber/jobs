@@ -462,12 +462,12 @@ public class BasicJobQueue implements JobQueue {
         }
 
         synchronized(isQueueReady) {
+            isQueueReady.set(true);
             for(JobQueueItem job : queueNotReadyList) {
                 if(job.getJob().areMultipleInstancesAllowed() || !inFlightUIDs.contains(job.getJob().getUID())) {
                     add(job);
                 }
             }
-            isQueueReady.set(true);
         }
 
         if(externalEventListener != null) {
