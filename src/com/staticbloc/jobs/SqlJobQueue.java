@@ -7,8 +7,9 @@ import android.database.DatabaseUtils;
 import android.database.sqlite.SQLiteDatabase;
 import android.database.sqlite.SQLiteOpenHelper;
 import android.util.Log;
-import com.google.gson.Gson;
+import com.google.gson.*;
 
+import java.lang.reflect.Type;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
@@ -16,10 +17,25 @@ import java.util.Map;
 
 public final class SqlJobQueue extends BasicPersistentJobQueue {
     private final DbHelper db;
+    private final Gson gson;
 
     public SqlJobQueue(Context context, JobQueueInitializer initializer) {
+        this(context, initializer, null);
+    }
+
+    public SqlJobQueue(Context context, JobQueueInitializer initializer, Map<Type, TypeAdapter> typeAdapters) {
         super(context, initializer);
         db = DbHelper.getInstance(context.getApplicationContext(), "com.staticbloc.jobs.db");
+        if(typeAdapters != null) {
+            GsonBuilder builder = new GsonBuilder();
+            for(Type t : typeAdapters.keySet()) {
+                builder.registerTypeAdapter(t, typeAdapters.get(t));
+            }
+            gson = builder.create();
+        }
+        else {
+            gson = new Gson();
+        }
     }
 
     @Override
@@ -30,7 +46,7 @@ public final class SqlJobQueue extends BasicPersistentJobQueue {
         getPersistenceExecutor().execute(new Runnable() {
             @Override
             public void run() {
-                addPersistedJobs(db.getAllJobsForQueue(getName()));
+                addPersistedJobs(db.getAllJobsForQueue(getName(), gson));
             }
         });
     }
@@ -43,7 +59,7 @@ public final class SqlJobQueue extends BasicPersistentJobQueue {
         getPersistenceExecutor().execute(new Runnable() {
             @Override
             public void run() {
-                db.addJob(getName(), job);
+                db.addJob(getName(), job, gson);
             }
         });
     }
@@ -82,9 +98,43 @@ public final class SqlJobQueue extends BasicPersistentJobQueue {
         getPersistenceExecutor().execute(new Runnable() {
             @Override
             public void run() {
-                db.updateJob(getName(), job, shouldDebugLog());
+                db.updateJob(getName(), job, shouldDebugLog(), gson);
             }
         });
+    }
+
+    public static class TypeAdapter<T> implements JsonSerializer<T>, JsonDeserializer<T> {
+        private static final String CLASSNAME = "CLASSNAME";
+        private static final String INSTANCE  = "INSTANCE";
+
+        @Override
+        public JsonElement serialize(T src, Type typeOfSrc,
+                                     JsonSerializationContext context) {
+
+            JsonObject retValue = new JsonObject();
+            String className = src.getClass().getCanonicalName();
+            retValue.addProperty(CLASSNAME, className);
+            JsonElement elem = context.serialize(src);
+            retValue.add(INSTANCE, elem);
+            return retValue;
+        }
+
+        @Override
+        public T deserialize(JsonElement json, Type typeOfT,
+                                 JsonDeserializationContext context) throws JsonParseException {
+            JsonObject jsonObject =  json.getAsJsonObject();
+            JsonPrimitive prim = (JsonPrimitive) jsonObject.get(CLASSNAME);
+            String className = prim.getAsString();
+
+            Class<?> klass = null;
+            try {
+                klass = Class.forName(className);
+            } catch (ClassNotFoundException e) {
+                e.printStackTrace();
+                throw new JsonParseException(e.getMessage());
+            }
+            return context.deserialize(jsonObject.get(INSTANCE), klass);
+        }
     }
 
     private static class DbHelper extends SQLiteOpenHelper {
@@ -116,16 +166,11 @@ public final class SqlJobQueue extends BasicPersistentJobQueue {
         private static final String JOB_WHERE_CLAUSE = KEY_ROW_ID + "=%d";
         private static final String ALL_JOBS_IN_QUEUE_WHERE_CLAUSE = KEY_QUEUE_NAME + "=%s";
 
-        private Gson gson;
-
-
         private DbHelper(Context context, String name) {
             super(context, name, null, DB_VERSION);
-
-            gson = new Gson();
         }
 
-        public List<JobQueueItem> getAllJobsForQueue(String queueName) {
+        public List<JobQueueItem> getAllJobsForQueue(String queueName, Gson gson) {
             queueName = DatabaseUtils.sqlEscapeString(queueName);
             Cursor c = null;
             try {
@@ -161,7 +206,7 @@ public final class SqlJobQueue extends BasicPersistentJobQueue {
             }
         }
 
-        public void addJob(String queueName, JobQueueItem job) {
+        public void addJob(String queueName, JobQueueItem job, Gson gson) {
             queueName = DatabaseUtils.sqlEscapeString(queueName);
             ContentValues values = new ContentValues();
             values.put(KEY_QUEUE_NAME, queueName);
@@ -170,7 +215,7 @@ public final class SqlJobQueue extends BasicPersistentJobQueue {
             jobToSqlIdMap.put(job, id);
         }
 
-        public void updateJob(String queueName, JobQueueItem job, boolean shouldLog) {
+        public void updateJob(String queueName, JobQueueItem job, boolean shouldLog, Gson gson) {
             Long id = jobToSqlIdMap.get(job);
             if(id == null) {
                 if(shouldLog) {
