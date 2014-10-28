@@ -112,6 +112,33 @@ public interface Job {
      */
     public void onRetryLimitReached();
 
+    /**
+     * Gets the current state of this {@code Job}.
+     */
+    public State getState();
+
+    /**
+     * Called by the {@link JobQueue} as this {@code Job}'s state changes. Should not be
+     * called by anyone except the {@code JobQueue}.
+     */
+    public void setState(State state);
+
+    /**
+     * This call will block until the job has been finished, failed, or canceled.
+     * * @throws java.lang.InterruptedException if it is interrupted
+     */
+    public State waitUntilDone() throws InterruptedException;
+
+    /**
+     * This call will block until the job has been finished, failed, or canceled.
+     * If {code timeoutMillis} is reached, an {@link InterruptedException} will be thrown.
+     *
+     * @param timeoutMillis max amount of milliseconds to block for
+     * @throws IllegalArgumentException if {@code timeoutMillis} < 0
+     * @throws InterruptedException if it is interrupted
+     */
+    public State waitUntilDone(long timeoutMillis) throws InterruptedException;
+
     public static enum State {
         NOTHING,
         IDENTICAL_JOB_REJECTED,
@@ -121,6 +148,7 @@ public interface Job {
         CANCELED,
         QUEUED,
         ACTIVE,
+        FAILED,
         FINISHED
     }
 }

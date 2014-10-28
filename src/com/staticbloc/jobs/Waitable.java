@@ -2,12 +2,18 @@ package com.staticbloc.jobs;
 
 public interface Waitable {
     /**
-     * Returns the amount of times {@link Waitable#notifyAsyncTaskDone()}
+     * Increments the amount of times {@link Waitable#notifyAsyncTaskDone()}
      * has to be called before {@link Waitable#waitForAsyncTasks()} will stop blocking.
+     * @return the amount of registered async tasks including this one
      * @see Waitable#notifyAsyncTaskDone()
      * @see Waitable#waitForAsyncTasks()
      */
-    public int getInitialLockCount();
+    public int registerAsyncTask();
+
+    /**
+     * Returns the amount of outstanding async tasks to wait for.
+     */
+    public int asyncTaskCount();
 
     /**
      * The invoking {@link java.lang.Thread} will wait until all locks are unlocked.

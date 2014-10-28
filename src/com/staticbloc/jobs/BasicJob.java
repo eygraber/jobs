@@ -14,13 +14,16 @@ public abstract class BasicJob implements Job, Waitable {
     private int retryLimit;
     private BackoffPolicy backoffPolicy;
 
-    private Throwable asyncThrowable = null;
-
     private int retryCount;
 
-    private final AtomicInteger asyncCountdown;
+    private transient Throwable asyncThrowable = null;
 
-    private Set<Object> subsections;
+    private transient final AtomicInteger asyncCountdown;
+
+    private transient Set<String> subsections;
+
+    private transient State state = State.NOTHING;
+    private transient final Object isDoneWaiter = new Object();
 
     /**
      * Will create a {@code BasicJob} using the defaults from {@link JobInitializer}.
@@ -43,7 +46,7 @@ public abstract class BasicJob implements Job, Waitable {
 
         retryCount = 0;
 
-        asyncCountdown = new AtomicInteger(getInitialLockCount());
+        asyncCountdown = new AtomicInteger(0);
 
         subsections = new HashSet<>();
     }
@@ -145,8 +148,51 @@ public abstract class BasicJob implements Job, Waitable {
     public void onRetryLimitReached() {}
 
     @Override
-    public int getInitialLockCount() {
-        return 0;
+    public final State getState() {
+        return state;
+    }
+
+    @Override
+    public final void setState(State state) {
+        this.state = state;
+        switch(state) {
+            case CANCELED:
+            case FAILED:
+            case FINISHED:
+                synchronized (isDoneWaiter) {
+                    isDoneWaiter.notifyAll();
+                }
+        }
+    }
+
+    @Override
+    public State waitUntilDone() throws InterruptedException {
+        synchronized (isDoneWaiter) {
+            while(state != State.CANCELED && state != State.FAILED && state != State.FINISHED) {
+                isDoneWaiter.wait();
+            }
+        }
+        return state;
+    }
+
+    @Override
+    public State waitUntilDone(long timeoutMillis) throws IllegalArgumentException, InterruptedException {
+        synchronized (isDoneWaiter) {
+            while(state != State.CANCELED && state != State.FAILED && state != State.FINISHED) {
+                isDoneWaiter.wait(timeoutMillis);
+            }
+        }
+        return state;
+    }
+
+    @Override
+    public final int registerAsyncTask() {
+        return asyncCountdown.incrementAndGet();
+    }
+
+    @Override
+    public final int asyncTaskCount() {
+        return asyncCountdown.get();
     }
 
     @Override
@@ -187,26 +233,24 @@ public abstract class BasicJob implements Job, Waitable {
      * <pre>
      * {@code
      *
-     * public class MyBasicJob extends BasicJob {
-     *     Object subsection2 = new Object();
-     *
+     * public class MyBasicJob extends BasicJob {     *
      *     public void performJob() {
      *         if(!isSubsectionComplete("subsection1") {
      *             // do something
-     *             setSubsectionComplete("test");
+     *             setSubsectionComplete("subsection1");
      *         }
-     *         if(!isSubsectionComplete(subsection2)) {
+     *         if(!isSubsectionComplete("subsection2")) {
      *             // do something
-     *             setSubsectionComplete(subsection2);
+     *             setSubsectionComplete("subsection2");
      *         }
      *     }
      * }
      * }
      * </pre>
      * @param subsectionKey an {@code Object} that functions as a key to identify a subsection
-     * @see BasicJob#isSubsectionComplete(Object)
+     * @see BasicJob#setSubsectionComplete(String)
      */
-    protected final boolean isSubsectionComplete(Object subsectionKey) {
+    protected final boolean isSubsectionComplete(String subsectionKey) {
         return subsections.contains(subsectionKey);
     }
 
@@ -220,34 +264,32 @@ public abstract class BasicJob implements Job, Waitable {
      * <pre>
      * {@code
      *
-     * public class MyBasicJob extends BasicJob {
-     *     Object subsection2 = new Object();
-     *
+     * public class MyBasicJob extends BasicJob {     *
      *     public void performJob() {
      *         if(!isSubsectionComplete("subsection1") {
      *             // do something
-     *             setSubsectionComplete("test");
+     *             setSubsectionComplete("subsection1");
      *         }
-     *         if(!isSubsectionComplete(subsection2)) {
+     *         if(!isSubsectionComplete("subsection2")) {
      *             // do something
-     *             setSubsectionComplete(subsection2);
+     *             setSubsectionComplete("subsection2");
      *         }
      *     }
      * }
      * }
      * </pre>
-     * @param subsectionKey an {@code Object} that functions as a key to identify a subsection
-     * @see BasicJob#isSubsectionComplete(Object)
+     * @param subsectionKey an {@code String} that functions as a key to identify a subsection
+     * @see BasicJob#isSubsectionComplete(String)
      */
-    protected final void setSubsectionComplete(Object subsectionKey) {
+    protected final void setSubsectionComplete(String subsectionKey) {
         subsections.add(subsectionKey);
     }
 
     /**
      * Marks a subsection of this {@code BasicJob}'s code as being incomplete.
-     * @param subsectionKey an {@code Object} that functions as a key to identify a subsection
+     * @param subsectionKey an {@code String} that functions as a key to identify a subsection
      */
-    protected final void clearSubsection(Object subsectionKey) {
+    protected final void clearSubsection(String subsectionKey) {
         subsections.remove(subsectionKey);
     }
 

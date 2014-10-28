@@ -557,7 +557,6 @@ public class BasicJobQueue implements JobQueue {
     protected final class JobQueueItem {
         private long validAtTime;
         private Job job;
-        private Job.State state = Job.State.NOTHING;
         private int groupIndex = -1;
 
         private int networkRetryCount = 0;
@@ -578,11 +577,11 @@ public class BasicJobQueue implements JobQueue {
         }
 
         public Job.State getState() {
-            return state;
+            return job.getState();
         }
 
         public void setState(Job.State state) {
-            this.state = state;
+            job.setState(state);
         }
 
         public long getValidAtTime() {
@@ -742,13 +741,14 @@ public class BasicJobQueue implements JobQueue {
                     }
                     job.getJob().performJob();
                     if(job.getJob() instanceof Waitable) {
-                        if(((Waitable) job.getJob()).getInitialLockCount() > 0) {
+                        Waitable waitable = (Waitable) job.getJob();
+                        if(waitable.asyncTaskCount() > 0) {
                             if(shouldDebugLog) {
                                 Log.d(getName(), String.format("%s may wait for async tasks",
                                         job.getJob().getClass().getSimpleName()));
                             }
                         }
-                        ((Waitable) job.getJob()).waitForAsyncTasks();
+                        waitable.waitForAsyncTasks();
                     }
                     onJobRemoved(job);
                     if(job.isGroupMember()) {
@@ -782,6 +782,7 @@ public class BasicJobQueue implements JobQueue {
                             try {
                                 job.getJob().onRetryLimitReached();
                             } catch(Throwable ignore) {}
+                            job.setState(Job.State.FAILED);
                             onJobRemoved(job);
                             if(job.isGroupMember()) {
                                 popGroupQueue();
@@ -826,6 +827,7 @@ public class BasicJobQueue implements JobQueue {
                         }
                     }
                     else {
+                        job.setState(Job.State.FAILED);
                         onJobRemoved(job);
                         if(job.isGroupMember()) {
                             popGroupQueue();
